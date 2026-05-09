@@ -21,7 +21,9 @@ Run `python step1_docling_parse.py test_corpus/simple_pdf/sample_5pages.pdf` onc
 
 | Document | Category | Elements Found | Expected | Status |
 |----------|----------|---------------|----------|--------|
-| sample_5pages.pdf | simple_pdf | pending model download | no GT | pending |
+| sample_5pages.pdf | simple_pdf | 9 | 9 (no GT, self-consistent) | ✅ ok |
+
+**Notes:** page_no is 1-based (Docling native). Table found on pages 4-5. No ground truth available for cell-level comparison.
 
 ## Complex Table Accuracy
 
