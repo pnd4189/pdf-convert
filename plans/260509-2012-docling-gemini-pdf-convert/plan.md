@@ -1,7 +1,7 @@
 ---
 plan: 260509-2012-docling-gemini-pdf-convert
 title: "Docling+Gemini Hybrid PDF-Convert (LandingAI ADE)"
-status: in_progress
+status: complete
 priority: P1
 created: 2026-05-09
 blocks: [project:260509-1246-pdf-convert-gemini-cli-autonomous]
@@ -10,7 +10,7 @@ blocks: [project:260509-1246-pdf-convert-gemini-cli-autonomous]
 # Plan: Docling+Gemini Hybrid PDF-Convert Skill
 
 **Date:** 2026-05-09
-**Status:** in_progress (phases 1-4 complete, phase 5 in_progress, phases 6-7 pending)
+**Status:** complete (phases 1-5 complete, phase 6 SKIPPED, phase 7 complete)
 **Source:** `plans/reports/brainstorm-260509-1942-docling-gemini-hybrid-architecture.md` (rev 2)
 **Target Skill:** `pdf-vision-parser` (path: `/home/dung/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts/`)
 **Hardware Target:** GMK M6 Ultra, 16GB RAM, 500GB SSD, CPU-only
@@ -41,9 +41,9 @@ This plan **blocks** `260509-1246-pdf-convert-gemini-cli-autonomous`. The autono
 | 2 | [Cache Layer & Docling Parse](phase-02-cache-and-docling-parse.md) | complete | P1 | 1 |
 | 3 | [Page Render & Gemini Refine](phase-03-render-and-gemini-refine.md) | complete | P1 | 2 |
 | 4 | [Merge Update & Shell Wrapper](phase-04-merge-and-wrapper.md) | complete | P1 | 3 |
-| 5 | [Accuracy Gate (PDF+DOCX + Complex Tables)](phase-05-accuracy-gate.md) | in_progress | P1 | 4 |
-| 6 | [PaddleOCR PP-StructureV3 (Conditional)](phase-06-paddleocr-conditional.md) | pending | P2 | 5 (gate fail) |
-| 7 | [Extended Formats & Stress Test](phase-07-extended-and-stress.md) | pending | P2 | 5 (or 6) |
+| 5 | [Accuracy Gate (PDF+DOCX + Complex Tables)](phase-05-accuracy-gate.md) | complete | P1 | 4 |
+| 6 | [PaddleOCR PP-StructureV3 (Conditional)](phase-06-paddleocr-conditional.md) | **skipped** | P2 | gate PASS |
+| 7 | [Extended Formats & Stress Test](phase-07-extended-and-stress.md) | complete | P2 | 5 |
 
 ## Files Affected
 
@@ -66,12 +66,12 @@ This plan **blocks** `260509-1246-pdf-convert-gemini-cli-autonomous`. The autono
 
 ## Success Criteria (Plan-Level)
 
-- [ ] All 7 (or 6 if PaddleOCR skipped) phases marked complete
-- [ ] Single `/pdf-convert <input>` works for: PDF text, PDF scanned, DOCX, EPUB, PPTX, image
-- [ ] Complex-table accuracy ≥95% cell-level (Phase 5 gate)
-- [ ] 200+ page PDF processes within 16GB RAM without swap thrash
-- [ ] Cache hit re-runs skip Docling parse (verified via timing)
-- [ ] EPUB text-only chapters skip Gemini calls (verified via token count)
+- [x] All 7 (or 6 if PaddleOCR skipped) phases marked complete (phase 6 skipped — gate PASS)
+- [x] Single `/pdf-convert <input>` works for: PDF text, PDF scanned, DOCX, EPUB, PPTX, image
+- [x] Complex-table accuracy ≥95% cell-level (Phase 5: F1=1.000)
+- [x] 200+ page PDF processes within 16GB RAM without swap thrash (streaming batches)
+- [x] Cache hit re-runs skip Docling parse (verified in Phase 2)
+- [x] EPUB text-only chapters skip Gemini calls (epub_router, 19/19 tests pass)
 
 ## Risks (Top-Level)
 
