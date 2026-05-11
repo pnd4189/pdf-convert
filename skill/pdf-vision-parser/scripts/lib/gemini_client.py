@@ -6,6 +6,7 @@ Retries on empty/short responses (< MIN_RESPONSE_CHARS chars) up to MAX_RETRIES 
 with a slightly varied prompt suffix to break repetition.
 """
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ MIN_RESPONSE_CHARS = 50
 MAX_RETRIES = 3
 CALL_TIMEOUT_SECS = 120
 RETRY_BACKOFF_SECS = [2, 5, 10]
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 def call_gemini(
@@ -23,16 +25,17 @@ def call_gemini(
     timeout: int = CALL_TIMEOUT_SECS,
 ) -> str:
     """
-    Call `gemini -p <prompt> [--image <path>] --yolo` via subprocess.
-    Returns response text or raises RuntimeError after MAX_RETRIES failures.
+    Call `gemini -p <prompt> -m <model> --yolo --include-directories /tmp` via subprocess.
+    Image is embedded as @path in prompt text. Returns response text or raises RuntimeError.
     """
     for attempt in range(MAX_RETRIES):
         # Append variation suffix on retries to avoid repeated empty responses
         effective_prompt = prompt if attempt == 0 else f"{prompt}\n\n[Retry {attempt}: ensure full ADE extraction]"
 
-        cmd = ["gemini", "-p", effective_prompt, "--yolo"]
         if image_path and Path(image_path).exists():
-            cmd += ["--image", image_path]
+            effective_prompt += f" @{image_path}"
+
+        cmd = ["gemini", "-p", effective_prompt, "-m", GEMINI_MODEL, "--yolo", "--include-directories", "/tmp"]
 
         try:
             proc = subprocess.run(

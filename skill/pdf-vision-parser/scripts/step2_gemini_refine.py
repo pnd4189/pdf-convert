@@ -20,6 +20,8 @@ from lib.gemini_client import call_gemini
 
 MAX_CONCURRENT = 3
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "ade_prompt_v2.txt"
+VISION_PROMPT_PATH = Path(__file__).resolve().parent / "ade_prompt_vision.txt"
+VISION_THRESHOLD = int(os.environ.get("DOCLING_SPARSE_THRESHOLD", "2"))
 
 
 def _trim_docling_page(page: dict) -> dict:
@@ -52,13 +54,26 @@ def _process_page(
     png_dir: Path,
     out_dir: Path,
     prompt_template: str,
+    vision_template: str,
 ) -> tuple[int, str]:
     """Process a single page: call Gemini, write MD file. Returns (page_no, status)."""
     page_no = page.get("page_no", 0)
     trimmed = _trim_docling_page(page)
-    docling_json = json.dumps(trimmed, ensure_ascii=False)
+    is_sparse = len(trimmed["elements"]) + len(trimmed["tables"]) <= VISION_THRESHOLD
 
-    prompt = prompt_template.format(page_no=page_no, docling_data=docling_json)
+    if is_sparse:
+        page_size = trimmed.get("size") or [0, 0]
+        if len(page_size) < 2:
+            page_size = [0, 0]
+        prompt = vision_template.format(
+            page_no=page_no,
+            page_size=f"[{page_size[0]}, {page_size[1]}]"
+        )
+        n_elem, n_tbl = len(trimmed["elements"]), len(trimmed["tables"])
+        print(f"[step2] page {page_no}: sparse ({n_elem} elements, {n_tbl} tables) → vision prompt", file=sys.stderr)
+    else:
+        docling_json = json.dumps(trimmed, ensure_ascii=False)
+        prompt = prompt_template.format(page_no=page_no, docling_data=docling_json)
 
     # Use 4-digit zero-padded PNG filename
     png_path = png_dir / f"{page_no:04d}.png"
@@ -99,14 +114,23 @@ def main() -> None:
         print("[step2] no pages in cache JSON", file=sys.stderr)
         sys.exit(1)
 
+    # Validate PNG coverage — warn if any page is missing its image
+    if not (png_dir / ".skip").exists():
+        rendered = {int(p.stem) for p in png_dir.glob("*.png")}
+        page_nos = {p.get("page_no") for p in pages}
+        missing = page_nos - rendered
+        if missing:
+            print(f"[step2] WARNING: {len(missing)} pages without PNG: {sorted(missing)}", file=sys.stderr)
+
     prompt_template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+    vision_template = VISION_PROMPT_PATH.read_text(encoding="utf-8")
 
     print(f"[step2] processing {len(pages)} pages (concurrency={MAX_CONCURRENT})", file=sys.stderr)
 
     failed = []
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
         futures = {
-            pool.submit(_process_page, page, png_dir, out_dir, prompt_template): page.get("page_no")
+            pool.submit(_process_page, page, png_dir, out_dir, prompt_template, vision_template): page.get("page_no")
             for page in pages
         }
         for future in as_completed(futures):

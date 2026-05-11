@@ -24,7 +24,7 @@ def _render_pdf(input_path: str, out_dir: Path, dpi: int = 300) -> int:
     print(f"[step1.5] rendering PDF at {dpi} DPI → {out_dir}", file=sys.stderr)
     images = convert_from_path(input_path, dpi=dpi)
     for i, img in enumerate(images):
-        img.save(out_dir / f"{i:04d}.png", "PNG")
+        img.save(out_dir / f"{i+1:04d}.png", "PNG")
     return len(images)
 
 
@@ -47,7 +47,7 @@ def _render_pptx(input_path: str, out_dir: Path) -> int:
         width_px = int(prs.slide_width / 914400 * 96)   # EMU → inches → 96 DPI pixels
         height_px = int(prs.slide_height / 914400 * 96)
         img = Image.new("RGB", (max(width_px, 800), max(height_px, 600)), color=(255, 255, 255))
-        img.save(out_dir / f"{i:04d}.png", "PNG")
+        img.save(out_dir / f"{i+1:04d}.png", "PNG")
         count += 1
     return count
 
