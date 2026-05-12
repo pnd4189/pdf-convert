@@ -113,3 +113,43 @@ Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Ti
 - **Resume**: deterministic workspace `/tmp/pdf_convert_<name>/` — re-run same command to resume failed pages only
 - **Page-level caching**: step2 skips already-processed pages (check `page_N.md` existence + validity)
 - **Retry**: step2 retries failed pages 2x; QA loop deletes bad pages + re-runs step2 for auto-repair
+
+## Auth & Model — OAuth Only, Auto-Detect Model
+
+**Auth**: subprocess `gemini -p` được **ép đi OAuth** (token tại `~/.gemini/oauth_creds.json`).
+Trước khi spawn, `gemini_client.py` strip toàn bộ env vars có thể switch sang API key/Vertex:
+`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`,
+`GOOGLE_GENAI_USE_GCA`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`,
+`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`. → Luôn dùng account OAuth (Ultra = no daily cap).
+
+**Model**: tự dò model đang vận hành trong Gemini CLI, không hard-code.
+Thứ tự ưu tiên trong `detect_active_model()`:
+
+1. `GEMINI_MODEL` env var (override thủ công)
+2. `~/.gemini/settings.json` field `model` (pin lâu dài)
+3. **Quét `~/.gemini/tmp/<project>/chats/*.jsonl` gần nhất → bắt `"model":"gemini-..."`** (mirror đúng model session interactive đang chạy — vd `gemini-3.1-pro-preview`)
+4. Bỏ qua `-m` → CLI tự chọn default
+
+Lần gọi đầu in ra:
+```
+[gemini_client] auth: OAuth (no API-key env vars present)
+[gemini_client] using model: gemini-3.1-pro-preview (source: recent session)
+```
+để verify.
+
+**Concurrency**: mặc định 3 (phù hợp OAuth Ultra). Override `GEMINI_CONCURRENCY=N`.
+
+**Hệ quả**: OAuth (đăng nhập Google) ≠ "miễn phí không giới hạn". Pro free tier ~50–100 RPD,
+Flash ~250–1500 RPD. PDF 386 trang × 1 request/trang × concurrency=3 → cháy quota Pro trong vài phút.
+
+**Khi gặp `QUOTA_EXHAUSTED` / `RESOURCE_EXHAUSTED` / "quota will reset"**:
+- Script tự halt ngay (không retry burn thêm), preserve cache. Resume sau khi reset.
+- **Workaround tức thì** — chuyển sang Flash (quota cao hơn 10–30x):
+  ```bash
+  GEMINI_MODEL=gemini-flash-latest bash scripts/auto_convert.sh <file>
+  ```
+- **Giảm burst**: concurrency mặc định **1** (giảm từ 3). Bump khi quota dư:
+  ```bash
+  GEMINI_CONCURRENCY=2 bash scripts/auto_convert.sh <file>
+  ```
+- Cần Pro chất lượng cao cho document dày → bật billing Google Cloud (vài trăm VND cho 386 trang).

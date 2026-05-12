@@ -17,9 +17,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.gemini_client import call_gemini
+from lib.gemini_client import call_gemini, QuotaExhaustedError
 
-MAX_CONCURRENT = 3
+# OAuth (Ultra) accounts have effectively no daily cap — keep concurrency at 3.
+# Lower to 1 if you're on a Free OAuth tier and need to stretch RPD.
+MAX_CONCURRENT = int(os.environ.get("GEMINI_CONCURRENCY", "3"))
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "ade_prompt_v2.txt"
 VISION_PROMPT_PATH = Path(__file__).resolve().parent / "ade_prompt_vision.txt"
 VISION_THRESHOLD = int(os.environ.get("DOCLING_SPARSE_THRESHOLD", "8"))
@@ -109,6 +111,10 @@ def _process_page(
         response = call_gemini(prompt, image_path=image_arg)
         out_path.write_text(response, encoding="utf-8")
         return page_no, "ok"
+    except QuotaExhaustedError:
+        # Do NOT write a failure marker — leave cache empty so resume re-tries this page
+        # after quota resets. Propagate up so the executor stops submitting new work.
+        raise
     except RuntimeError as e:
         print(f"[step2] page {page_no} FAILED: {e}", file=sys.stderr)
         out_path.write_text(f"<!-- GEMINI EXTRACTION FAILED page {page_no} -->", encoding="utf-8")
@@ -163,6 +169,7 @@ def main() -> None:
 
     failed: list[int] = []
     cached_count = 0
+    quota_hit = False
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
         futures = {
@@ -172,6 +179,19 @@ def main() -> None:
         for future in as_completed(futures):
             try:
                 page_no, status = future.result()
+            except QuotaExhaustedError as qe:
+                quota_hit = True
+                # Cancel still-pending futures; in-flight ones will finish naturally
+                for f in futures:
+                    f.cancel()
+                print(
+                    f"\n[step2] QUOTA EXHAUSTED — halting. Reason: {qe}\n"
+                    f"[step2] Cache preserved at {out_dir}. Re-run after quota reset OR\n"
+                    f"[step2]   set GEMINI_MODEL=gemini-flash-latest (much higher daily quota)\n"
+                    f"[step2]   set GEMINI_CONCURRENCY=1 (default; raise only if quota allows)",
+                    file=sys.stderr,
+                )
+                break
             except Exception as e:
                 print(f"[step2] UNEXPECTED thread error: {type(e).__name__}: {e}", file=sys.stderr)
                 continue
@@ -181,6 +201,9 @@ def main() -> None:
                 cached_count += 1
             else:
                 print(f"[step2] page {page_no} ✓", file=sys.stderr, end="\r")
+
+    if quota_hit:
+        sys.exit(2)
 
     print(f"\n[step2] phase 1 done — {len(pages) - len(failed)}/{len(pages)} ok ({cached_count} cached)", file=sys.stderr)
 
@@ -200,6 +223,11 @@ def main() -> None:
             for future in as_completed(futures):
                 try:
                     page_no, status = future.result()
+                except QuotaExhaustedError as qe:
+                    for f in futures:
+                        f.cancel()
+                    print(f"\n[step2] QUOTA EXHAUSTED during retry — halting. {qe}", file=sys.stderr)
+                    sys.exit(2)
                 except Exception:
                     continue
                 if status == "failed":
