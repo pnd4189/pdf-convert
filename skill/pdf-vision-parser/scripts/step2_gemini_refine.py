@@ -138,6 +138,16 @@ def main() -> None:
         print("Usage: step2_gemini_refine.py <cache_json> <png_dir> <output_md_dir>", file=sys.stderr)
         sys.exit(1)
 
+    if os.environ.get("PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS") != "1":
+        print(
+            "ERROR: step2_gemini_refine.py is disabled by default because it spawns "
+            "`gemini -p` subprocess calls. /pdf-convert must use the active Gemini CLI "
+            "model in the current slash-command turn. If you intentionally want the "
+            "legacy subprocess path, rerun with PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS=1.",
+            file=sys.stderr,
+        )
+        sys.exit(64)
+
     _check_gemini_available()
 
     cache_json_path = sys.argv[1]

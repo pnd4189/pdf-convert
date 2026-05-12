@@ -9,6 +9,21 @@
 # --keep-temp: preserve temp_png/ and temp_md/ after completion
 set -euo pipefail
 
+if [[ "${PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS:-}" != "1" ]]; then
+    cat >&2 <<'EOF'
+ERROR: auto_convert.sh is the legacy pipeline and would call `gemini -p` in a
+subprocess for each page. That is forbidden for /pdf-convert because it can hit
+Gemini CLI/API quota paths and does not use the active slash-command model.
+
+Use prepare_native_workspace.sh from /pdf-convert, then let the current Gemini
+CLI model inspect page images and write page_N.md files directly.
+
+To intentionally run the old subprocess pipeline, set:
+  PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS=1
+EOF
+    exit 64
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${HOME}/.claude/skills/.venv/bin/python3"
 # Prevent Docling from phoning home to HuggingFace CDN when models are already cached

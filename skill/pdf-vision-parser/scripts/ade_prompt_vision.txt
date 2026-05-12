@@ -6,6 +6,7 @@ Dimensions: {page_size}
 
 **YOUR TASK:**
 Perform exhaustive OCR of this page image. Extract ALL visible text into Visually Grounded Markdown.
+Also extract ALL visual semantics. Complex diagrams/charts/star maps are first-class content, not decoration.
 
 **SOURCE STRATEGY:**
 - The IMAGE is your ONLY source for ALL visible content
@@ -15,6 +16,7 @@ Perform exhaustive OCR of this page image. Extract ALL visible text into Visuall
   - Every cell label, annotation, caption, and marginal note
   - Text within images, overlays, and complex visual layouts
 - NEVER summarize or caption text-containing regions. TRANSCRIBE character by character.
+- NEVER omit the visual structure around text. For diagrams, describe nodes, circles, boxes, grid cells, arrows, dashed/solid lines, colors, numeric markers, relative positions, and relationships.
 
 **ZERO-HALLUCINATION RULE:**
 Extract only what is visually present. No summarization. No inference.
@@ -40,8 +42,20 @@ If the image shows text arranged in rows/columns (even without visible borders),
 ## ONTOLOGY ENTITIES
 Wrap non-text visual elements: `<:: [detailed description] : [type] ::>`
 Valid types: figure, logo, scan_code, attestation, marginalia
-Only use for truly non-text visual elements (logos, QR codes, decorative images).
+For diagrams/charts/star maps, use `figure` even when the visual contains readable text. First transcribe readable labels, then add a detailed `figure` ontology for spatial structure and relationships that plain text/table cells cannot capture.
 Place anchor tag immediately before each ontology entity.
+
+## REQUIRED VISION PROVENANCE
+The first line of the output MUST be:
+`<!-- VISION_SOURCE: actual PNG path -->`
+
+## COMPLEX VISUAL RULE
+If the page contains any chart, diagram, star map, grid, node-link graphic, circle/box layout, dashed/solid connector, arrow, or multi-panel visual:
+- Create one anchored `figure` ontology for each visual region.
+- Description must be detailed enough to reconstruct the layout verbally:
+  labels, node shapes, filled/unfilled state, colors, positions, lines, arrows, direction, grouping, and relationships.
+- If a visual is a grid/table, also create an HTML `<table>` with all readable cells.
+Do not write only the caption. Do not rely on Docling text alone.
 
 ## BLANK PAGE
 If page is genuinely empty: output exactly `<!-- TRANG TRỐNG - ĐÃ XÁC MINH -->`

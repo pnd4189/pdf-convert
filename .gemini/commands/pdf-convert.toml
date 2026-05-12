@@ -1,0 +1,94 @@
+description = "Convert PDF/DOCX/EPUB/PPTX documents to Visually Grounded Markdown and JSON using the active Gemini CLI model only"
+prompt = """<objective>
+Convert a document into Visually Grounded Markdown with normalized coordinate anchors and Cell-level Grounding,
+then package into structured JSON. Use only the active Gemini CLI OAuth session/model that is executing this slash command.
+</objective>
+
+<execution_context>
+Scripts: /home/dung/.gemini/pdf-convert/ plus read-only source scripts under /home/dung/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts/
+Pipeline: prepare_native_workspace.sh → active Gemini CLI model reads page images → step2.75 (QA) → step3 (merge)
+Output: /home/dung/ANTIGRAVITY/SÁCH CONVERT/
+</execution_context>
+
+<context>
+Arguments: $ARGUMENTS
+
+If no file path given, ask: "Vui long cung cap duong dan file can chuyen doi."
+Supported formats: PDF, DOCX, EPUB, PPTX, HTML, images.
+</context>
+
+<process>
+1. Parse the input file path from $ARGUMENTS.
+2. Derive output name from the filename stem (without extension).
+3. Run preprocessing only:
+
+   bash /home/dung/.gemini/pdf-convert/prepare_native_workspace.sh \
+     "<input_file_path>" \
+     --name "<output_name>" \
+     --keep-temp
+
+   Optional flag:
+   - Add `--fast` only to skip Docling and render PDF pages directly.
+
+4. Open `/tmp/pdf_convert_<output_name>/native_manifest.json`.
+   Read `visual_candidates` carefully. Every listed page contains visual pixels that Docling text/table extraction did not cover.
+
+5. Process pages using ONLY this currently running Gemini CLI model:
+   - Read rendered images from `/tmp/pdf_convert_<output_name>/temp_png/NNNN.png`.
+   - Use Docling cache context from the manifest when useful.
+   - Write each page to `/tmp/pdf_convert_<output_name>/temp_md/page_N.md`.
+   - Resume by skipping existing valid `page_N.md` files.
+   - If the task exceeds turn limits, stop cleanly and tell the user to rerun the same command; never start a subprocess model.
+   - ABSOLUTELY DO NOT create/use helper scripts such as `generate_md.py` to dump Docling text into Markdown.
+   - ABSOLUTELY DO NOT synthesize `page_N.md` from Docling JSON alone.
+   - For each page processed from PNG, the first line MUST be:
+     `<!-- VISION_SOURCE: /tmp/pdf_convert_<output_name>/temp_png/NNNN.png -->`
+
+6. Per-page Markdown MUST follow ADE rules:
+   - Verbatim extraction only, no summarization.
+   - HTML `<table>` only, never Markdown tables.
+   - Every paragraph/heading/table/figure has `<a id='page-seq' box='[left, top, right, bottom]'></a>`.
+   - Coordinates are normalized floats from 0.00 to 1.00.
+   - `<table>`, `<td>`, and `<th>` all have sequential IDs.
+   - Every complex visual region MUST be represented. Do not only transcribe nearby captions.
+   - For diagrams/charts/star maps with nodes, lines, arrows, grids, circles, or spatial relationships:
+     transcribe all readable labels AND add a detailed ontology entity:
+     `<a id='page-seq' box='[left, top, right, bottom]'></a>`
+     `<:: detailed description of nodes, labels, line styles, positions, directions, relationships, and any numbered/color-coded cells : figure ::>`
+   - If the visual is a structured grid/table, create an HTML table and still add a figure ontology when the overall diagram has arrows, paths, or relationships not captured by cells alone.
+   - Pages in `visual_candidates` MUST NOT pass without either detailed `figure` ontology or a complete HTML table plus figure ontology when the page caption/text says hình/đồ/sơ đồ/biểu đồ/chart/diagram.
+
+7. Run QA:
+
+   python3 /home/dung/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts/step2.75_qa_sweep.py \
+     --md-dir "/tmp/pdf_convert_<output_name>/temp_md" \
+     --manifest "/tmp/pdf_convert_<output_name>/native_manifest.json"
+
+   Fix every CRITICAL issue by reopening the corresponding image and editing the page markdown.
+   Re-run QA until 0 CRITICAL.
+
+8. Merge:
+
+   python3 /home/dung/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts/step3_merge.py \
+     --name "<output_name>" \
+     --md-dir "/tmp/pdf_convert_<output_name>/temp_md" \
+     --docling-cache "<docling_cache_from_manifest>"
+
+9. Confirm output file path to the user when done.
+
+Never run these from `/pdf-convert`:
+   - `auto_convert.sh`
+   - `step2_gemini_refine.py`
+   - `gemini -p`
+   - Google GenAI / Vertex / API-key clients
+   - ad-hoc scripts that generate Markdown from Docling JSON/text only, including `generate_md.py`
+
+CRITICAL RULES:
+- ACTIVE MODEL ONLY: no API key, no `gemini -p`, no subprocess model calls.
+- ZERO-HALLUCINATION: verbatim extraction only, no summarization.
+- VISION-FIRST: rendered PNG is the source of truth for page content and all visual semantics.
+- FAIL-FAST: if image processing cannot be completed in the active Gemini CLI turn/context, stop and preserve workspace; do not fall back to Docling-only Markdown.
+- NO markdown tables — HTML <table> with Cell-level IDs.
+- 1-based page indexing for rendered filenames and page_N.md names.
+</process>
+"""

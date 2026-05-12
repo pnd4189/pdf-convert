@@ -24,6 +24,9 @@ Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Ti
 ## BƯỚC 2: BÓC TÁCH THỊ GIÁC CHUẨN LANDING.AI (Vision Loop)
 - Dùng `view_file` nhìn từng ảnh `page_X.png`. Phân tích nghiêm ngặt theo **[KỶ LUẬT TRÍCH XUẤT ADE]** bên dưới.
 - Dùng `write_to_file` ghi Markdown ra `.agents/temp/temp_md/page_X.md`. Xử lý batch 5-10 trang/lượt. (Cấm in kết quả ra khung chat).
+- Dòng đầu tiên của mỗi file phải là `<!-- VISION_SOURCE: <đường_dẫn_png> -->` để chứng minh trang được xử lý từ ảnh render.
+- CẤM tạo script kiểu `generate_md.py` để dump text từ Docling JSON sang Markdown. Nếu hết turn/context, dừng an toàn và bảo người dùng chạy lại cùng lệnh; không fallback text-only.
+- Mọi trang trong `native_manifest.json.visual_candidates` bắt buộc phải được mở ảnh PNG và mô tả visual semantics chi tiết.
 
 ## BƯỚC 2.5: KIỂM TRA TRANG TRỐNG VÀ SOÁT LỖI
 - Quét các file `.md` rỗng/ngắn. Dùng `view_file` nhìn lại ảnh gốc.
@@ -55,6 +58,8 @@ Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Ti
 **3. Hệ Thực thể Mở rộng (Expanded Ontology):**
 - Bọc mô tả các đối tượng đa phương thức trong cú pháp: `<:: [Mô tả chi tiết] : [loại_thực_thể] ::>`. (Đặt thẻ `<a id='...'></a>` ngay trước cú pháp này).
 - Các `[loại_thực_thể]` hợp lệ: `figure` (biểu đồ), `logo` (logo), `scan_code` (mã QR/vạch), `attestation` (chữ ký/con dấu), `marginalia` (ghi chú viết tay lề).
+- Với biểu đồ/sơ đồ/tinh đồ/grid có chữ, KHÔNG chỉ chép caption hoặc label. Phải vừa chép mọi chữ đọc được, vừa thêm `<:: ... : figure ::>` mô tả chi tiết các nút/ô, vị trí tương đối, đường nối, mũi tên, nét đứt/liền, màu sắc/số thứ tự và quan hệ không gian.
+- Nếu visual là bảng/lưới có cấu trúc, phải dùng HTML `<table>` cho dữ liệu ô; nếu có đường nối/mũi tên/quan hệ tổng thể ngoài ô bảng thì vẫn phải thêm ontology `figure`.
 
 # CẤU TRÚC JSON ĐẦU RA (BƯỚC 3)
 
@@ -114,42 +119,24 @@ Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Ti
 - **Page-level caching**: step2 skips already-processed pages (check `page_N.md` existence + validity)
 - **Retry**: step2 retries failed pages 2x; QA loop deletes bad pages + re-runs step2 for auto-repair
 
-## Auth & Model — OAuth Only, Auto-Detect Model
+## Auth & Model — Active Gemini CLI Model Only
 
-**Auth**: subprocess `gemini -p` được **ép đi OAuth** (token tại `~/.gemini/oauth_creds.json`).
-Trước khi spawn, `gemini_client.py` strip toàn bộ env vars có thể switch sang API key/Vertex:
-`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`,
-`GOOGLE_GENAI_USE_GCA`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`,
-`VERTEXAI_PROJECT`, `VERTEXAI_LOCATION`. → Luôn dùng account OAuth (Ultra = no daily cap).
+`/pdf-convert` TUYỆT ĐỐI KHÔNG được gọi `gemini -p`, Google GenAI SDK, Vertex,
+API key, hoặc bất kỳ subprocess/model client nào để xử lý trang PDF.
 
-**Model**: tự dò model đang vận hành trong Gemini CLI, không hard-code.
-Thứ tự ưu tiên trong `detect_active_model()`:
+Luồng đúng:
 
-1. `GEMINI_MODEL` env var (override thủ công)
-2. `~/.gemini/settings.json` field `model` (pin lâu dài)
-3. **Quét `~/.gemini/tmp/<project>/chats/*.jsonl` gần nhất → bắt `"model":"gemini-..."`** (mirror đúng model session interactive đang chạy — vd `gemini-3.1-pro-preview`)
-4. Bỏ qua `-m` → CLI tự chọn default
+1. Chạy `prepare_native_workspace.sh` để Docling/render/cache deterministic.
+2. Chính model đang chạy trong Gemini CLI mở ảnh trang trong `temp_png/`.
+3. Chính model đang chạy ghi Markdown từng trang vào `temp_md/page_N.md`.
+4. Chạy QA và merge bằng script local thuần Python.
 
-Lần gọi đầu in ra:
-```
-[gemini_client] auth: OAuth (no API-key env vars present)
-[gemini_client] using model: gemini-3.1-pro-preview (source: recent session)
-```
-để verify.
+`auto_convert.sh` và `step2_gemini_refine.py` là legacy subprocess path và đã
+bị khóa mặc định. Chỉ được bật lại thủ công bằng
+`PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS=1`, không dùng cho `/pdf-convert`.
 
-**Concurrency**: mặc định 3 (phù hợp OAuth Ultra). Override `GEMINI_CONCURRENCY=N`.
+**Fail-fast visual guardrail**:
 
-**Hệ quả**: OAuth (đăng nhập Google) ≠ "miễn phí không giới hạn". Pro free tier ~50–100 RPD,
-Flash ~250–1500 RPD. PDF 386 trang × 1 request/trang × concurrency=3 → cháy quota Pro trong vài phút.
-
-**Khi gặp `QUOTA_EXHAUSTED` / `RESOURCE_EXHAUSTED` / "quota will reset"**:
-- Script tự halt ngay (không retry burn thêm), preserve cache. Resume sau khi reset.
-- **Workaround tức thì** — chuyển sang Flash (quota cao hơn 10–30x):
-  ```bash
-  GEMINI_MODEL=gemini-flash-latest bash scripts/auto_convert.sh <file>
-  ```
-- **Giảm burst**: concurrency mặc định **1** (giảm từ 3). Bump khi quota dư:
-  ```bash
-  GEMINI_CONCURRENCY=2 bash scripts/auto_convert.sh <file>
-  ```
-- Cần Pro chất lượng cao cho document dày → bật billing Google Cloud (vài trăm VND cho 386 trang).
+- `prepare_native_workspace.sh` tạo `native_manifest.json.visual_candidates` bằng cách so sánh PNG với bbox text/table từ Docling.
+- `step2.75_qa_sweep.py --manifest native_manifest.json` sẽ FAIL nếu trang có visual candidate nhưng Markdown thiếu mô tả `figure`/HTML table phù hợp.
+- QA cũng FAIL nếu trang nhắc tới hình/đồ/sơ đồ/biểu đồ nhưng thiếu `<:: mô tả chi tiết : figure ::>`.

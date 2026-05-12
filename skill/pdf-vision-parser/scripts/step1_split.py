@@ -30,14 +30,15 @@ def main():
 
     doc = fitz.open(pdf_path)
     mat = fitz.Matrix(ZOOM, ZOOM)
+    page_count = len(doc)
     for i, page in enumerate(doc, start=0):
         # 1-indexed, zero-padded to match step2 expectation: {page_no:04d}.png
         page_no = i + 1
         page.get_pixmap(matrix=mat).save(os.path.join(out_dir, f"{page_no:04d}.png"))
-        if i % 10 == 0 or i == len(doc) - 1:
-            print(f"  Rendered {page_no}/{len(doc)} pages...")
+        if i % 10 == 0 or i == page_count - 1:
+            print(f"  Rendered {page_no}/{page_count} pages...")
     doc.close()
-    print(f"[step1_split] rendered {len(doc)} pages → {out_dir}", file=sys.stderr)
+    print(f"[step1_split] rendered {page_count} pages → {out_dir}", file=sys.stderr)
 
 
 if __name__ == "__main__":
