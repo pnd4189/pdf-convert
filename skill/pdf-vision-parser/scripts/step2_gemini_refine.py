@@ -4,6 +4,7 @@ step2_gemini_refine.py — Per-page Gemini ADE refinement consuming Docling JSON
 
 Calls gemini CLI per page with structured Docling data + PNG → writes ADE Markdown.
 Concurrent calls capped at MAX_CONCURRENT (default 3) to respect rate limits.
+Page-level caching: skips pages with existing valid output (resume capability).
 
 Usage:
     python step2_gemini_refine.py <cache_json> <png_dir> <output_md_dir>
@@ -21,7 +22,9 @@ from lib.gemini_client import call_gemini
 MAX_CONCURRENT = 3
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "ade_prompt_v2.txt"
 VISION_PROMPT_PATH = Path(__file__).resolve().parent / "ade_prompt_vision.txt"
-VISION_THRESHOLD = int(os.environ.get("DOCLING_SPARSE_THRESHOLD", "2"))
+VISION_THRESHOLD = int(os.environ.get("DOCLING_SPARSE_THRESHOLD", "8"))
+RETRY_MAX = 2
+FAILURE_MARKER = "<!-- GEMINI EXTRACTION FAILED"
 
 
 def _trim_docling_page(page: dict) -> dict:
@@ -49,6 +52,19 @@ def _trim_docling_page(page: dict) -> dict:
     }
 
 
+def _page_is_cached(out_path: Path) -> bool:
+    """Check if page output exists and is valid (not a failure marker)."""
+    if not out_path.exists():
+        return False
+    try:
+        content = out_path.read_text(encoding="utf-8").strip()
+        if content and FAILURE_MARKER not in content:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _process_page(
     page: dict,
     png_dir: Path,
@@ -56,8 +72,14 @@ def _process_page(
     prompt_template: str,
     vision_template: str,
 ) -> tuple[int, str]:
-    """Process a single page: call Gemini, write MD file. Returns (page_no, status)."""
+    """Process a single page: check cache, call Gemini, write MD file. Returns (page_no, status)."""
     page_no = page.get("page_no", 0)
+    out_path = out_dir / f"page_{page_no}.md"
+
+    # Page-level cache: skip if already successfully processed
+    if _page_is_cached(out_path):
+        return page_no, "cached"
+
     trimmed = _trim_docling_page(page)
     is_sparse = len(trimmed["elements"]) + len(trimmed["tables"]) <= VISION_THRESHOLD
 
@@ -85,21 +107,32 @@ def _process_page(
 
     try:
         response = call_gemini(prompt, image_path=image_arg)
-        out_path = out_dir / f"page_{page_no}.md"
         out_path.write_text(response, encoding="utf-8")
         return page_no, "ok"
     except RuntimeError as e:
         print(f"[step2] page {page_no} FAILED: {e}", file=sys.stderr)
-        # Write empty marker so QA sweep can flag it
-        out_path = out_dir / f"page_{page_no}.md"
         out_path.write_text(f"<!-- GEMINI EXTRACTION FAILED page {page_no} -->", encoding="utf-8")
         return page_no, "failed"
+    except Exception as e:
+        print(f"[step2] page {page_no} UNEXPECTED ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        out_path.write_text(f"<!-- GEMINI EXTRACTION FAILED page {page_no} -->", encoding="utf-8")
+        return page_no, "failed"
+
+
+def _check_gemini_available() -> None:
+    """Fail fast if gemini CLI is not installed."""
+    import shutil
+    if not shutil.which("gemini"):
+        print("ERROR: gemini CLI not found — ensure it is installed and in PATH", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> None:
     if len(sys.argv) < 4:
         print("Usage: step2_gemini_refine.py <cache_json> <png_dir> <output_md_dir>", file=sys.stderr)
         sys.exit(1)
+
+    _check_gemini_available()
 
     cache_json_path = sys.argv[1]
     png_dir = Path(sys.argv[2])
@@ -125,25 +158,62 @@ def main() -> None:
     prompt_template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     vision_template = VISION_PROMPT_PATH.read_text(encoding="utf-8")
 
+    # Phase 1: process all pages (cached ones skipped)
     print(f"[step2] processing {len(pages)} pages (concurrency={MAX_CONCURRENT})", file=sys.stderr)
 
-    failed = []
+    failed: list[int] = []
+    cached_count = 0
+
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
         futures = {
             pool.submit(_process_page, page, png_dir, out_dir, prompt_template, vision_template): page.get("page_no")
             for page in pages
         }
         for future in as_completed(futures):
-            page_no, status = future.result()
+            try:
+                page_no, status = future.result()
+            except Exception as e:
+                print(f"[step2] UNEXPECTED thread error: {type(e).__name__}: {e}", file=sys.stderr)
+                continue
             if status == "failed":
                 failed.append(page_no)
+            elif status == "cached":
+                cached_count += 1
             else:
                 print(f"[step2] page {page_no} ✓", file=sys.stderr, end="\r")
 
-    print(f"\n[step2] done — {len(pages) - len(failed)}/{len(pages)} ok", file=sys.stderr)
+    print(f"\n[step2] phase 1 done — {len(pages) - len(failed)}/{len(pages)} ok ({cached_count} cached)", file=sys.stderr)
+
+    # Phase 2: retry failed pages
+    for retry in range(RETRY_MAX):
+        if not failed:
+            break
+        print(f"[step2] retry {retry+1}/{RETRY_MAX} for {len(failed)} failed pages: {sorted(failed)}", file=sys.stderr)
+        retry_pages = [p for p in pages if p.get("page_no") in failed]
+        retry_failed: list[int] = []
+
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
+            futures = {
+                pool.submit(_process_page, page, png_dir, out_dir, prompt_template, vision_template): page.get("page_no")
+                for page in retry_pages
+            }
+            for future in as_completed(futures):
+                try:
+                    page_no, status = future.result()
+                except Exception:
+                    continue
+                if status == "failed":
+                    retry_failed.append(page_no)
+                else:
+                    print(f"[step2] page {page_no} ✓ (retry {retry+1})", file=sys.stderr)
+        failed = retry_failed
+
+    # Final summary
     if failed:
-        print(f"[step2] FAILED pages: {sorted(failed)}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[step2] FAILED pages after {RETRY_MAX} retries: {sorted(failed)}", file=sys.stderr)
+        # Don't sys.exit(1) — let pipeline continue with partial results
+    else:
+        print(f"[step2] all {len(pages)} pages processed successfully", file=sys.stderr)
 
     print(str(out_dir))
 

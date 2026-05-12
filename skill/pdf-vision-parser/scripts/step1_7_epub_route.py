@@ -48,7 +48,7 @@ def main() -> None:
     for page in text_pages:
         page_no = page.get("page_no", 0)
         md_content = build_docling_markdown_for_page(page)
-        out_file = temp_md / f"page_{page_no:04d}.md"
+        out_file = temp_md / f"page_{page_no}.md"
         out_file.write_text(md_content, encoding="utf-8")
         print(f"[epub_route] text-only page {page_no} → {out_file.name}", file=sys.stderr)
 

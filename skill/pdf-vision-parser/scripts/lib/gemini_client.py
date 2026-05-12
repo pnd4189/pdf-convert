@@ -16,7 +16,9 @@ MIN_RESPONSE_CHARS = 50
 MAX_RETRIES = 3
 CALL_TIMEOUT_SECS = 120
 RETRY_BACKOFF_SECS = [2, 5, 10]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Use the gemini CLI's currently active model by default. Only pass -m when the
+# user explicitly sets GEMINI_MODEL — never hardcode a model id here.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip()
 
 
 def call_gemini(
@@ -25,8 +27,9 @@ def call_gemini(
     timeout: int = CALL_TIMEOUT_SECS,
 ) -> str:
     """
-    Call `gemini -p <prompt> -m <model> --yolo --include-directories /tmp` via subprocess.
-    Image is embedded as @path in prompt text. Returns response text or raises RuntimeError.
+    Call `gemini -p <prompt> [-m <model>] --yolo --include-directories /tmp` via subprocess.
+    Model defaults to whatever the gemini CLI session has active; pass GEMINI_MODEL
+    env var only if you need to override. Image is embedded as @path in prompt text.
     """
     for attempt in range(MAX_RETRIES):
         # Append variation suffix on retries to avoid repeated empty responses
@@ -35,7 +38,10 @@ def call_gemini(
         if image_path and Path(image_path).exists():
             effective_prompt += f" @{image_path}"
 
-        cmd = ["gemini", "-p", effective_prompt, "-m", GEMINI_MODEL, "--yolo", "--include-directories", "/tmp"]
+        cmd = ["gemini", "-p", effective_prompt]
+        if GEMINI_MODEL:
+            cmd += ["-m", GEMINI_MODEL]
+        cmd += ["--yolo", "--include-directories", "/tmp"]
 
         try:
             proc = subprocess.run(

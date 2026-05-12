@@ -45,18 +45,20 @@ if [[ -z "$OUTPUT_NAME" ]]; then
     OUTPUT_NAME="$(basename "${INPUT_FILE%.*}")"
 fi
 
-# ── Temp directories ─────────────────────────────────────────────────────────
-TEMP_BASE="$(mktemp -d /tmp/pdf_convert_XXXXXX)"
+# ── Deterministic temp directories (resume-capable) ──────────────────────────
+# Keyed by OUTPUT_NAME so re-runs find previous results
+TEMP_BASE="/tmp/pdf_convert_${OUTPUT_NAME}"
 TEMP_PNG="${TEMP_BASE}/temp_png"
 TEMP_MD="${TEMP_BASE}/temp_md"
 mkdir -p "$TEMP_PNG" "$TEMP_MD"
 
+PIPELINE_SUCCESS=false
 cleanup() {
-    if [[ "$KEEP_TEMP" == "false" ]]; then
+    if [[ "$KEEP_TEMP" == "false" && "$PIPELINE_SUCCESS" == "true" ]]; then
         rm -rf "$TEMP_BASE"
         echo "[auto_convert] cleaned temp: $TEMP_BASE" >&2
     else
-        echo "[auto_convert] kept temp: $TEMP_BASE" >&2
+        echo "[auto_convert] kept temp: $TEMP_BASE (for resume)" >&2
     fi
 }
 trap cleanup EXIT
@@ -69,6 +71,26 @@ IS_EPUB=false
 echo "[auto_convert] input: $INPUT_FILE (format: $FILE_EXT)" >&2
 echo "[auto_convert] output name: $OUTPUT_NAME" >&2
 echo "[auto_convert] fast_mode: $FAST_MODE | epub_fast_path: $IS_EPUB" >&2
+echo "[auto_convert] workspace: $TEMP_BASE" >&2
+
+# ── Auto-detect scanned PDF ──────────────────────────────────────────────────
+if [[ "$FILE_EXT" == "pdf" && "$FAST_MODE" == "false" ]]; then
+    AVG_CHARS=$("$PYTHON" -c "
+import fitz, sys
+try:
+    doc = fitz.open(sys.argv[1])
+    total = sum(len(p.get_text()) for p in doc)
+    n = max(len(doc), 1)
+    print(total // n)
+    doc.close()
+except Exception:
+    print(999)
+" "$INPUT_FILE" 2>/dev/null || echo "999")
+    if [[ "$AVG_CHARS" -lt 5 ]]; then
+        echo "[auto_convert] detected scanned PDF (avg ${AVG_CHARS} chars/page) → fast mode" >&2
+        FAST_MODE=true
+    fi
+fi
 
 # ── STEP 0: Cache check ───────────────────────────────────────────────────────
 CACHE_KEY=""
@@ -100,7 +122,9 @@ fi
 # ── STEP 1.5: Render pages to PNG (skipped in fast mode — step1_split already did it) ──
 if [[ "$FAST_MODE" == "false" ]]; then
     echo "[auto_convert] STEP 1.5: render pages" >&2
-    "$PYTHON" "$SCRIPT_DIR/step1.5_render_pages.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$INPUT_FILE" || true
+    if ! "$PYTHON" "$SCRIPT_DIR/step1.5_render_pages.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$INPUT_FILE"; then
+        echo "[auto_convert] WARNING: page rendering failed — proceeding without images" >&2
+    fi
 fi
 
 # ── STEP 1.7: EPUB fast-path routing ─────────────────────────────────────────
@@ -135,28 +159,42 @@ else
         PAGE_COUNT=$(ls "$TEMP_PNG"/*.png 2>/dev/null | wc -l)
         "$PYTHON" -c "
 import json, sys
-pages = [{'page_no': i, 'elements': [], 'tables': [], 'size': [0,0]} for i in range($PAGE_COUNT)]
+pages = [{'page_no': i, 'elements': [], 'tables': [], 'size': [0,0]} for i in range(1, $PAGE_COUNT + 1)]
 print(json.dumps({'version':'fast','source_hash':'','format':'pdf','pages':pages}))
 " > "$FAKE_CACHE"
         CACHE_JSON_PATH="$FAKE_CACHE"
     fi
-    "$PYTHON" "$SCRIPT_DIR/step2_gemini_refine.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$TEMP_MD"
+    # Graceful: don't let partial failure kill pipeline
+    "$PYTHON" "$SCRIPT_DIR/step2_gemini_refine.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$TEMP_MD" || true
 fi
 
-# ── STEP 2.75: QA sweep (up to 3 fix attempts) ───────────────────────────────
+# ── STEP 2.75: QA sweep with retry ───────────────────────────────────────────
 echo "[auto_convert] STEP 2.75: QA sweep" >&2
 QA_ATTEMPTS=0
 QA_MAX=3
 while [[ $QA_ATTEMPTS -lt $QA_MAX ]]; do
     QA_RESULT=$("$PYTHON" "$SCRIPT_DIR/step2.75_qa_sweep.py" --md-dir "$TEMP_MD" 2>&1) || true
-    CRITICAL_COUNT=$(echo "$QA_RESULT" | grep -c "CRITICAL" || echo "0")
-    echo "[auto_convert] QA attempt $((QA_ATTEMPTS+1)): $CRITICAL_COUNT CRITICAL issues" >&2
-    if [[ "$CRITICAL_COUNT" == "0" ]]; then
+    CRITICAL_PAGES=$(echo "$QA_RESULT" | grep -oP 'page_\d+\.md' | sort -u || true)
+    CRITICAL_COUNT=$(echo "$CRITICAL_PAGES" | grep -c '.' || echo "0")
+    echo "[auto_convert] QA attempt $((QA_ATTEMPTS+1)): $CRITICAL_COUNT pages with CRITICAL issues" >&2
+    if [[ "$CRITICAL_COUNT" == "0" || -z "$CRITICAL_PAGES" ]]; then
         break
     fi
+
+    # Delete bad page files so step2 re-processes them (page-level caching skips good ones)
+    for f in $CRITICAL_PAGES; do
+        echo "[auto_convert] deleting bad page for retry: $f" >&2
+        rm -f "$TEMP_MD/$f"
+    done
+
+    # Re-run step2 for failed pages only (cached pages skipped)
+    if [[ "$EPUB_SKIP_GEMINI" != "true" ]]; then
+        "$PYTHON" "$SCRIPT_DIR/step2_gemini_refine.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$TEMP_MD" || true
+    fi
+
     QA_ATTEMPTS=$((QA_ATTEMPTS + 1))
     if [[ $QA_ATTEMPTS -ge $QA_MAX ]]; then
-        echo "[auto_convert] WARNING: $CRITICAL_COUNT CRITICAL issues remain after $QA_MAX attempts — proceeding" >&2
+        echo "[auto_convert] WARNING: CRITICAL issues remain after $QA_MAX attempts — proceeding" >&2
     fi
 done
 
@@ -172,4 +210,5 @@ fi
     --md-dir "$TEMP_MD" \
     $DOCLING_ARG
 
+PIPELINE_SUCCESS=true
 echo "[auto_convert] DONE: /home/dung/ANTIGRAVITY/SÁCH CONVERT/${OUTPUT_NAME}.json" >&2

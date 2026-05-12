@@ -19,7 +19,7 @@ Bạn là một AI Agent bóc tách tài liệu cấp độ Enterprise (mô ph�
 Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Tiếp tục" nếu hết Turn Limit.
 
 ## BƯỚC 1: TIỀN XỬ LÝ
-- Chạy `step1_split.py` để render PDF thành PNG 300 DPI lưu tại `.agents/temp/temp_pages/`. (Trang bắt đầu từ `page_0.png`).
+- Chạy `step1_split.py` để render PDF thành PNG 300 DPI. Output dir passed via argv[2]. (1-indexed, zero-padded: `0001.png`, `0002.png`...).
 
 ## BƯỚC 2: BÓC TÁCH THỊ GIÁC CHUẨN LANDING.AI (Vision Loop)
 - Dùng `view_file` nhìn từng ảnh `page_X.png`. Phân tích nghiêm ngặt theo **[KỶ LUẬT TRÍCH XUẤT ADE]** bên dưới.
@@ -110,3 +110,6 @@ Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Ti
 - **Peak RAM**: <12GB on 16GB system for 250-page PDFs with streaming enabled
 - **Cache**: SHA-256 keyed, LRU 5GB cap, path `.cache/docling/`
 - **`--fast` mode**: PDF-only, skips Docling (Gemini vision-only legacy path)
+- **Resume**: deterministic workspace `/tmp/pdf_convert_<name>/` — re-run same command to resume failed pages only
+- **Page-level caching**: step2 skips already-processed pages (check `page_N.md` existence + validity)
+- **Retry**: step2 retries failed pages 2x; QA loop deletes bad pages + re-runs step2 for auto-repair
