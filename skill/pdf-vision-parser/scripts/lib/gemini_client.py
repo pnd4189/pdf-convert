@@ -10,14 +10,20 @@ import json
 import os
 import re
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+from .model_registry import discover_used_models
 
 MIN_RESPONSE_CHARS = 50
 MAX_RETRIES = 3
 CALL_TIMEOUT_SECS = 120
 RETRY_BACKOFF_SECS = [2, 5, 10]
+QUOTA_VERIFY_TIMEOUT_SECS = 30
+QUOTA_PROMPT_MARKER_NAME = "QUOTA_PROMPT.json"
 
 GEMINI_HOME = Path(os.environ.get("GEMINI_HOME", str(Path.home() / ".gemini")))
 # Regex captures any "model":"gemini-..." occurrence in session logs / settings.
@@ -26,6 +32,15 @@ _MODEL_PATTERN = re.compile(r'"model"\s*:\s*"(gemini-[A-Za-z0-9.\-]+)"')
 _MIN_SESSION_BYTES = 300
 
 _RESOLVED_MODEL_CACHE: Optional[str] = None
+
+# Quota-switch coordination — shared across ThreadPoolExecutor workers.
+# First thread to hit quota acquires the lock, verifies, prompts user, and
+# updates _RESOLVED_MODEL_CACHE. Other threads then transparently use the new
+# model on their next call. _TERMINAL_QUOTA short-circuits if user picked 'q'
+# or no alternative model is available.
+_SWITCH_LOCK = threading.Lock()
+_EXHAUSTED_MODELS: set[str] = set()
+_TERMINAL_QUOTA = False
 
 
 def _read_settings_model() -> str:
@@ -173,6 +188,184 @@ def _build_oauth_env() -> dict:
     return env
 
 
+def _verify_quota_truly_exhausted(model: str) -> bool:
+    """
+    Probe the model with a tiny no-op prompt to confirm quota is actually exhausted
+    (not a transient 429 / misclassified error). Returns True only if probe also
+    reports a quota marker. Uses OAuth env so probe matches main call path.
+    """
+    cmd = ["gemini", "-p", "ok"]
+    if model:
+        cmd += ["-m", model]
+    cmd += ["--yolo"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=QUOTA_VERIFY_TIMEOUT_SECS,
+            env=_build_oauth_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # Treat probe failure as "cannot confirm" → assume exhausted to be safe.
+        return True
+    return _is_quota_error(proc.stderr or "") or _is_quota_error(proc.stdout or "")
+
+
+def _write_quota_marker(workspace: Path, exhausted: str, candidates: list[str]) -> Path:
+    """Drop a JSON marker so user can resume by setting GEMINI_MODEL env var."""
+    marker = workspace / QUOTA_PROMPT_MARKER_NAME
+    payload = {
+        "exhausted_model": exhausted,
+        "exhausted_so_far": sorted(_EXHAUSTED_MODELS | {exhausted}),
+        "candidate_models": candidates,
+        "instruction": (
+            "Stdin/tty unavailable for interactive prompt. "
+            "Pick one of candidate_models and re-run /pdf-convert with "
+            "GEMINI_MODEL=<chosen> to resume from this workspace."
+        ),
+    }
+    try:
+        marker.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        print(f"[gemini_client] failed to write quota marker: {e}", file=sys.stderr)
+    return marker
+
+
+def _resolve_workspace_dir() -> Optional[Path]:
+    """Best-effort: derive the /tmp/pdf_convert_<name>/ workspace from sys.argv."""
+    for arg in sys.argv:
+        if arg and "/tmp/pdf_convert_" in arg:
+            p = Path(arg)
+            while p.parent != p:
+                if p.name.startswith("pdf_convert_"):
+                    return p
+                p = p.parent
+    return None
+
+
+def _prompt_model_switch(exhausted_model: str) -> Optional[str]:
+    """
+    Interactive: list user-known alternative models, read choice from /dev/tty.
+    Returns chosen model id, or None to terminate (user 'q' / no candidates / no tty).
+    Caller must hold _SWITCH_LOCK.
+    """
+    all_known = discover_used_models()
+    candidates = [m for m in all_known if m != exhausted_model and m not in _EXHAUSTED_MODELS]
+
+    if not candidates:
+        print(
+            f"\n[gemini_client] ⛔ no alternative models found in your Gemini CLI history.\n"
+            f"[gemini_client]    Open `gemini` interactively, run /model to switch, then resume.\n",
+            file=sys.stderr,
+        )
+        return None
+
+    banner = (
+        f"\n─────────────────────────────────────────────────────────\n"
+        f"⚠️  QUOTA EXHAUSTED — model: {exhausted_model}\n"
+        f"    (verified by probe call; not a transient error)\n"
+        f"─────────────────────────────────────────────────────────\n"
+        f"Pick a replacement model for the rest of this run\n"
+        f"(in-memory only — your CLI's active model is NOT modified):\n"
+    )
+    # Build menu text once, write to tty so worker stderr noise doesn't interleave.
+    menu_lines = [banner]
+    for i, m in enumerate(candidates, 1):
+        menu_lines.append(f"  [{i}] {m}\n")
+    menu_lines.append("  [q] Stop + keep workspace for resume\n")
+    menu_lines.append("Choose: ")
+
+    try:
+        tty = open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+    except OSError:
+        workspace = _resolve_workspace_dir()
+        print(
+            f"\n[gemini_client] ⚠️  /dev/tty unavailable — cannot prompt interactively.\n",
+            file=sys.stderr,
+        )
+        if workspace:
+            marker = _write_quota_marker(workspace, exhausted_model, candidates)
+            print(f"[gemini_client] wrote: {marker}", file=sys.stderr)
+        return None
+
+    try:
+        tty.write("".join(menu_lines))
+        tty.flush()
+        for _ in range(3):
+            choice = tty.readline().strip().lower()
+            if choice == "q":
+                tty.write("[gemini_client] user chose to stop. Workspace preserved.\n")
+                tty.flush()
+                return None
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(candidates):
+                    chosen = candidates[idx - 1]
+                    tty.write(f"[gemini_client] switching to: {chosen}\n")
+                    tty.flush()
+                    return chosen
+            tty.write("Invalid choice. Enter a number or 'q': ")
+            tty.flush()
+        tty.write("[gemini_client] too many invalid attempts. Stopping.\n")
+        tty.flush()
+        return None
+    finally:
+        tty.close()
+
+
+def _handle_quota_exhaustion(failing_model: str, stderr_msg: str) -> None:
+    """
+    Coordinated quota-switch flow. First thread in verifies + prompts; others
+    block on the lock and inherit the new cached model on return.
+
+    `failing_model` is the model the caller used when it hit the quota error.
+    If another thread already switched away from it, this returns immediately
+    so the caller retries with the new model. Otherwise we probe-verify, mark
+    the model exhausted, and prompt the user.
+
+    Raises QuotaExhaustedError if user declines, no alternative exists, or
+    /dev/tty is unavailable. On success: updates _RESOLVED_MODEL_CACHE, returns
+    silently → caller retries.
+    """
+    global _RESOLVED_MODEL_CACHE, _TERMINAL_QUOTA
+
+    with _SWITCH_LOCK:
+        if _TERMINAL_QUOTA:
+            raise QuotaExhaustedError("quota terminal — user declined switch")
+
+        current = _RESOLVED_MODEL_CACHE
+        # Another thread may have switched after our subprocess started but
+        # before we grabbed the lock. Detect that and let caller retry with new.
+        if current and failing_model and current != failing_model:
+            return
+
+        target = failing_model or current or ""
+        if target and target in _EXHAUSTED_MODELS:
+            # Another thread already handled this exact failure.
+            return
+
+        # Verify it's a real exhaustion — guards against transient 429 misclassification.
+        if target and not _verify_quota_truly_exhausted(target):
+            print(
+                f"[gemini_client] probe says {target} is responsive — treating as transient.",
+                file=sys.stderr,
+            )
+            return  # caller retries same model
+
+        if target:
+            _EXHAUSTED_MODELS.add(target)
+        chosen = _prompt_model_switch(target or "(cli default)")
+        if not chosen:
+            _TERMINAL_QUOTA = True
+            raise QuotaExhaustedError(
+                f"user declined model switch (exhausted: {sorted(_EXHAUSTED_MODELS)})"
+            )
+
+        _RESOLVED_MODEL_CACHE = chosen
+        return  # caller retries with chosen model
+
+
 def call_gemini(
     prompt: str,
     image_path: Optional[str] = None,
@@ -207,9 +400,13 @@ def call_gemini(
             response = proc.stdout.strip()
             stderr = proc.stderr or ""
 
-            # Fail-fast on quota exhaustion — retries cannot help (per-account daily cap)
+            # Quota handling: verify + interactive switch (held by _SWITCH_LOCK).
+            # _handle_quota_exhaustion re-raises QuotaExhaustedError if user declines
+            # or no alternative exists; otherwise it updates the cached model and we
+            # transparently retry on the next loop iteration with the new -m value.
             if _is_quota_error(stderr) or _is_quota_error(response):
-                raise QuotaExhaustedError(stderr.strip()[:500] or "quota exhausted")
+                _handle_quota_exhaustion(active_model, stderr.strip()[:500] or "quota exhausted")
+                continue  # retry with new model now in _RESOLVED_MODEL_CACHE
 
             if len(response) >= MIN_RESPONSE_CHARS:
                 return response

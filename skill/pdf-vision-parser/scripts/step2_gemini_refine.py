@@ -195,10 +195,12 @@ def main() -> None:
                 for f in futures:
                     f.cancel()
                 print(
-                    f"\n[step2] QUOTA EXHAUSTED — halting. Reason: {qe}\n"
-                    f"[step2] Cache preserved at {out_dir}. Re-run after quota reset OR\n"
-                    f"[step2]   set GEMINI_MODEL=gemini-flash-latest (much higher daily quota)\n"
-                    f"[step2]   set GEMINI_CONCURRENCY=1 (default; raise only if quota allows)",
+                    f"\n[step2] QUOTA EXHAUSTED (terminal) — halting. Reason: {qe}\n"
+                    f"[step2] Workspace preserved at {out_dir.parent} for resume.\n"
+                    f"[step2] To resume: re-run /pdf-convert (page-level cache will skip done pages).\n"
+                    f"[step2] You can also pre-pick a model via:\n"
+                    f"[step2]   GEMINI_MODEL=<model_id> /pdf-convert ...\n"
+                    f"[step2] or open `gemini`, switch model with /model, then re-run.",
                     file=sys.stderr,
                 )
                 break

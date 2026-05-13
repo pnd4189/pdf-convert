@@ -16,16 +16,17 @@ Bạn là một AI Agent bóc tách tài liệu cấp độ Enterprise (mô ph�
 2. **KỶ LUẬT ZERO-HALLUCINATION:** Giả lập trạng thái `Temperature = 0.0`. Trích xuất văn bản, bảng biểu nguyên bản 100%. Không tóm tắt, không suy diễn.
 
 # QUY TRÌNH THỰC THI TỰ ĐỘNG - AGENTIC WORKFLOW
-Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Tiếp tục" nếu hết Turn Limit.
+Thực hiện bằng driver tự động của Gemini CLI. Không dừng sau từng batch để chờ người dùng gõ "Tiếp tục"; nếu bị giới hạn quota/auth/QA thật sự thì dừng fail-fast và giữ workspace để resume.
 
 ## BƯỚC 1: TIỀN XỬ LÝ
-- Chạy `step1_split.py` để render PDF thành PNG 300 DPI. Output dir passed via argv[2]. (1-indexed, zero-padded: `0001.png`, `0002.png`...).
+- Slash command `/pdf-convert` chạy `bash /home/dung/.gemini/pdf-convert/auto_convert.sh "<input>" --name "<output_name>" --keep-temp`.
+- Driver gọi `prepare_native_workspace.sh` để render/cache deterministic và tạo `native_manifest.json`. Output PNG dùng 1-indexed, zero-padded: `0001.png`, `0002.png`...
 
 ## BƯỚC 2: BÓC TÁCH THỊ GIÁC CHUẨN LANDING.AI (Vision Loop)
-- Dùng `view_file` nhìn từng ảnh `page_X.png`. Phân tích nghiêm ngặt theo **[KỶ LUẬT TRÍCH XUẤT ADE]** bên dưới.
-- Dùng `write_to_file` ghi Markdown ra `.agents/temp/temp_md/page_X.md`. Xử lý batch 5-10 trang/lượt. (Cấm in kết quả ra khung chat).
+- Driver dùng Gemini CLI subprocess theo từng trang (`gemini -p`) để nhìn ảnh `page_X.png`. Mỗi subprocess chỉ nhận một trang nên không làm tràn context của chat đang chạy.
+- Ghi Markdown ra `/tmp/pdf_convert_<output_name>/temp_md/page_X.md`. Skip file đã hợp lệ để resume.
 - Dòng đầu tiên của mỗi file phải là `<!-- VISION_SOURCE: <đường_dẫn_png> -->` để chứng minh trang được xử lý từ ảnh render.
-- CẤM tạo script kiểu `generate_md.py` để dump text từ Docling JSON sang Markdown. Nếu hết turn/context, dừng an toàn và bảo người dùng chạy lại cùng lệnh; không fallback text-only.
+- CẤM tạo script kiểu `generate_md.py` để dump text từ Docling JSON sang Markdown. Không fallback text-only cho trang cần vision.
 - Mọi trang trong `native_manifest.json.visual_candidates` bắt buộc phải được mở ảnh PNG và mô tả visual semantics chi tiết.
 
 ## BƯỚC 2.5: KIỂM TRA TRANG TRỐNG VÀ SOÁT LỖI
@@ -119,21 +120,40 @@ Thực hiện tuần tự 4 bước sau. Dừng và chờ người dùng gõ "Ti
 - **Page-level caching**: step2 skips already-processed pages (check `page_N.md` existence + validity)
 - **Retry**: step2 retries failed pages 2x; QA loop deletes bad pages + re-runs step2 for auto-repair
 
-## Auth & Model — Active Gemini CLI Model Only
+## Auth & Model — Automated Gemini CLI OAuth Driver
 
-`/pdf-convert` TUYỆT ĐỐI KHÔNG được gọi `gemini -p`, Google GenAI SDK, Vertex,
-API key, hoặc bất kỳ subprocess/model client nào để xử lý trang PDF.
+`/pdf-convert` dùng driver tự động `/home/dung/.gemini/pdf-convert/auto_convert.sh`.
+Driver được phép gọi `gemini -p` theo từng trang vì đây là cách duy nhất để tài liệu
+lớn chạy tới cuối mà không cần người dùng gõ "Tiếp tục" giữa các lượt chat.
 
 Luồng đúng:
 
 1. Chạy `prepare_native_workspace.sh` để Docling/render/cache deterministic.
-2. Chính model đang chạy trong Gemini CLI mở ảnh trang trong `temp_png/`.
-3. Chính model đang chạy ghi Markdown từng trang vào `temp_md/page_N.md`.
-4. Chạy QA và merge bằng script local thuần Python.
+2. Driver gọi `step2_gemini_refine.py` với `PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS=1`.
+3. Mỗi lời gọi Gemini chỉ xử lý một trang PNG và ghi `temp_md/page_N.md`.
+4. Chạy QA bằng `native_manifest.json`; trang lỗi bị xóa và xử lý lại.
+5. Chỉ merge JSON sau khi QA pass. Nếu quota/auth/QA vẫn fail sau retry, giữ workspace để resume.
 
-`auto_convert.sh` và `step2_gemini_refine.py` là legacy subprocess path và đã
-bị khóa mặc định. Chỉ được bật lại thủ công bằng
-`PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS=1`, không dùng cho `/pdf-convert`.
+Không dùng Google GenAI SDK, Vertex hoặc API key. `gemini_client.py` strip các biến
+môi trường API-key/Vertex để ép subprocess dùng OAuth của Gemini CLI.
+
+**Quota-aware model switch (interactive)**:
+
+- Default vẫn dùng đúng model active trong CLI session (không tự ý đổi).
+- Khi gặp `RESOURCE_EXHAUSTED/429`, driver gọi `_verify_quota_truly_exhausted()` (probe call) để loại false-positive.
+- Nếu xác nhận exhausted thật, prompt qua `/dev/tty` liệt kê các model user **đã từng dùng** (lấy từ `~/.gemini/tmp/*/chats/*.jsonl` — không hardcode):
+  ```
+  ⚠️  QUOTA EXHAUSTED — model: gemini-3.1-pro-preview
+  Pick a replacement model for the rest of this run:
+    [1] gemini-2.5-pro
+    [2] gemini-2.5-flash
+    [q] Stop + keep workspace for resume
+  Choose:
+  ```
+- Lựa chọn của user chỉ áp dụng **trong process hiện tại** (in-memory `_RESOLVED_MODEL_CACHE`); không ghi vào `~/.gemini/settings.json`, không phá CLI session.
+- Nếu `/dev/tty` không khả dụng → ghi `QUOTA_PROMPT.json` vào workspace + exit để user resume bằng `GEMINI_MODEL=<chosen> /pdf-convert ...`.
+- Nếu user chọn `q` hoặc không còn model thay thế → terminal quota → giữ workspace để resume sau.
+- Mọi lần switch đều exclude các model đã exhausted khỏi list lần sau.
 
 **Fail-fast visual guardrail**:
 
