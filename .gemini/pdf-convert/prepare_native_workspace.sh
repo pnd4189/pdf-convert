@@ -112,13 +112,13 @@ if [[ "$FAST_MODE" == "false" ]]; then
     fi
 
     echo "[prepare_native] STEP 1.5: render pages" >&2
-    if ! "$PYTHON" "$SOURCE_SCRIPT_DIR/step1.5_render_pages.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$INPUT_FILE"; then
+    if ! "$PYTHON" "$SOURCE_SCRIPT_DIR/step1.5_render_pages.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$INPUT_FILE" >&2; then
         echo "[prepare_native] WARNING: page rendering failed — native extraction may be text-only" >&2
         touch "$TEMP_PNG/.skip"
     fi
 else
     echo "[prepare_native] STEP 1 (fast): PDF split via step1_split.py" >&2
-    "$FITZ_PYTHON" "$SOURCE_SCRIPT_DIR/step1_split.py" "$INPUT_FILE" "$TEMP_PNG"
+    "$FITZ_PYTHON" "$SOURCE_SCRIPT_DIR/step1_split.py" "$INPUT_FILE" "$TEMP_PNG" >&2
     PAGE_COUNT=$(find "$TEMP_PNG" -maxdepth 1 -name '*.png' | wc -l)
     CACHE_JSON_PATH="${TEMP_BASE}/fast_cache.json"
     "$PYTHON" -c "
