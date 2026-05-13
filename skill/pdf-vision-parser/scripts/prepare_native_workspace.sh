@@ -69,31 +69,25 @@ FILE_EXT="${FILE_EXT,,}"
 IS_EPUB=false
 [[ "$FILE_EXT" == "epub" ]] && IS_EPUB=true
 
+IS_IMAGE=false
+case "$FILE_EXT" in
+    png|jpg|jpeg|gif|webp|bmp|tif|tiff) IS_IMAGE=true ;;
+esac
+
 echo "[prepare_native] input: $INPUT_FILE (format: $FILE_EXT)" >&2
 echo "[prepare_native] output name: $OUTPUT_NAME" >&2
 echo "[prepare_native] workspace: $TEMP_BASE" >&2
 echo "[prepare_native] mode: ACTIVE_GEMINI_CLI_MODEL_ONLY (no subprocess Gemini/API)" >&2
 
-if [[ "$FILE_EXT" == "pdf" && "$FAST_MODE" == "false" ]]; then
-    if python_has_module "$FITZ_PYTHON" fitz; then
-        AVG_CHARS=$("$FITZ_PYTHON" -c "
-import fitz, sys
-try:
-    doc = fitz.open(sys.argv[1])
-    total = sum(len(p.get_text()) for p in doc)
-    n = max(len(doc), 1)
-    print(total // n)
-    doc.close()
-except Exception:
-    print(999)
-" "$INPUT_FILE" 2>/dev/null || echo "999")
-    else
-        AVG_CHARS=999
+# Docling is unreliable for PDFs (sparse extraction on OCR'd / scanned-like PDFs
+# leads to visual_audit false-positives + repair-loop blowups). PDFs now always
+# go vision-only. Images skip Docling too — they're already pure vision input.
+# Docling stays load-bearing for DOCX/PPTX/EPUB where structural extraction wins.
+if [[ "$FILE_EXT" == "pdf" || "$IS_IMAGE" == "true" ]]; then
+    if [[ "$FAST_MODE" == "false" ]]; then
+        echo "[prepare_native] $FILE_EXT format -> bypassing Docling (vision-only pipeline)" >&2
     fi
-    if [[ "$AVG_CHARS" -lt 5 ]]; then
-        echo "[prepare_native] detected scanned PDF (avg ${AVG_CHARS} chars/page) -> fast render mode" >&2
-        FAST_MODE=true
-    fi
+    FAST_MODE=true
 fi
 
 CACHE_JSON_PATH=""
@@ -112,19 +106,19 @@ if [[ "$FAST_MODE" == "false" ]]; then
     fi
 
     echo "[prepare_native] STEP 1.5: render pages" >&2
-    if ! "$PYTHON" "$SOURCE_SCRIPT_DIR/step1.5_render_pages.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$INPUT_FILE"; then
+    if ! "$PYTHON" "$SOURCE_SCRIPT_DIR/step1.5_render_pages.py" "$CACHE_JSON_PATH" "$TEMP_PNG" "$INPUT_FILE" >&2; then
         echo "[prepare_native] WARNING: page rendering failed — native extraction may be text-only" >&2
         touch "$TEMP_PNG/.skip"
     fi
 else
-    echo "[prepare_native] STEP 1 (fast): PDF split via step1_split.py" >&2
-    "$FITZ_PYTHON" "$SOURCE_SCRIPT_DIR/step1_split.py" "$INPUT_FILE" "$TEMP_PNG"
+    echo "[prepare_native] STEP 1 (fast): split via step1_split.py ($FILE_EXT)" >&2
+    "$FITZ_PYTHON" "$SOURCE_SCRIPT_DIR/step1_split.py" "$INPUT_FILE" "$TEMP_PNG" >&2
     PAGE_COUNT=$(find "$TEMP_PNG" -maxdepth 1 -name '*.png' | wc -l)
     CACHE_JSON_PATH="${TEMP_BASE}/fast_cache.json"
     "$PYTHON" -c "
 import json
 pages = [{'page_no': i, 'elements': [], 'tables': [], 'size': [0, 0]} for i in range(1, $PAGE_COUNT + 1)]
-print(json.dumps({'version': 'fast-native', 'source_hash': '', 'format': 'pdf', 'pages': pages}))
+print(json.dumps({'version': 'fast-native', 'source_hash': '', 'format': '$FILE_EXT', 'pages': pages}))
 " > "$CACHE_JSON_PATH"
 fi
 
@@ -146,13 +140,21 @@ if [[ "$IS_EPUB" == "true" && "$FAST_MODE" == "false" && -n "$CACHE_JSON_PATH" ]
 fi
 
 MANIFEST="${TEMP_BASE}/native_manifest.json"
-"$PYTHON" - "$INPUT_FILE" "$OUTPUT_NAME" "$TEMP_BASE" "$TEMP_PNG" "$TEMP_MD" "$CACHE_JSON_PATH" "$EPUB_SKIP_GEMINI" "$SOURCE_SCRIPT_DIR" > "$MANIFEST" <<'PY'
+SKIP_VISUAL_AUDIT="false"
+if [[ "$FILE_EXT" == "pdf" || "$FAST_MODE" == "true" ]]; then
+    # No reliable Docling baseline -> visual_audit would false-positive on every
+    # text-dense page. Trust Gemini vision instead.
+    SKIP_VISUAL_AUDIT="true"
+fi
+
+"$PYTHON" - "$INPUT_FILE" "$OUTPUT_NAME" "$TEMP_BASE" "$TEMP_PNG" "$TEMP_MD" "$CACHE_JSON_PATH" "$EPUB_SKIP_GEMINI" "$SOURCE_SCRIPT_DIR" "$SKIP_VISUAL_AUDIT" "$FILE_EXT" > "$MANIFEST" <<'PY'
 import json
 import sys
 from pathlib import Path
 import importlib.util
 
-input_file, output_name, temp_base, png_dir, md_dir, cache_json, skip_native, source_script_dir = sys.argv[1:]
+(input_file, output_name, temp_base, png_dir, md_dir, cache_json,
+ skip_native, source_script_dir, skip_visual_audit, file_ext) = sys.argv[1:]
 pages = []
 cache_path = Path(cache_json)
 if cache_json and cache_path.exists():
@@ -164,9 +166,13 @@ if cache_json and cache_path.exists():
 if not pages:
     pages = sorted(int(p.stem) for p in Path(png_dir).glob("*.png") if p.stem.isdigit())
 
+# visual_audit only runs when we have a real Docling baseline. For PDFs (now
+# always vision-only) and other formats explicitly opted out, skip it.
 visual_candidates = []
+skip_va = skip_visual_audit.lower() == "true"
 visual_audit_path = Path(source_script_dir) / "visual_audit.py"
-if cache_json and visual_audit_path.exists() and not (Path(png_dir) / ".skip").exists():
+if (not skip_va and cache_json and visual_audit_path.exists()
+        and not (Path(png_dir) / ".skip").exists()):
     spec = importlib.util.spec_from_file_location("pdf_convert_visual_audit", visual_audit_path)
     if spec and spec.loader:
         module = importlib.util.module_from_spec(spec)
@@ -177,11 +183,13 @@ print(json.dumps({
     "mode": "active_gemini_cli_model_only",
     "input_file": input_file,
     "output_name": output_name,
+    "format": file_ext,
     "workspace": temp_base,
     "png_dir": png_dir,
     "md_dir": md_dir,
     "docling_cache": cache_json,
     "visual_candidates": visual_candidates,
+    "skip_visual_audit": skip_va,
     "skip_native_extraction": skip_native.lower() == "true",
     "pages": pages,
     "page_count": len(pages),

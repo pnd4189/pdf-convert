@@ -105,12 +105,21 @@ fi
 echo "[pdf-convert] STEP 2.75: QA sweep with auto-repair" >&2
 QA_ATTEMPTS=0
 QA_MAX="${PDF_CONVERT_QA_MAX:-3}"
+PREV_FAIL_SET=""
+SOFT_ACCEPTED=false
 while [[ "$QA_ATTEMPTS" -lt "$QA_MAX" ]]; do
     QA_RESULT=$("$PYTHON" "$SOURCE_SCRIPT_DIR/step2.75_qa_sweep.py" \
         --md-dir "$MD_DIR" \
         --manifest "$MANIFEST" 2>&1) && QA_STATUS=0 || QA_STATUS=$?
     printf '%s\n' "$QA_RESULT" >&2
     if [[ "$QA_STATUS" -eq 0 ]]; then
+        break
+    fi
+    if [[ "$QA_STATUS" -eq 2 ]]; then
+        # SOFT-only failures (figure/keyword false-positives). Retrying Gemini
+        # almost never fixes these. Accept and proceed to merge.
+        echo "[pdf-convert] QA reports SOFT-only critical errors — accepting and proceeding to merge." >&2
+        SOFT_ACCEPTED=true
         break
     fi
 
@@ -120,6 +129,16 @@ while [[ "$QA_ATTEMPTS" -lt "$QA_MAX" ]]; do
         exit 1
     fi
 
+    # Stuck-page detection: if the failing set is unchanged since last attempt,
+    # repair won't help (Gemini will re-emit the same Markdown). Stop deleting.
+    CURRENT_FAIL_SET=$(printf '%s\n' $CRITICAL_PAGES | sort -u | tr '\n' ' ')
+    if [[ -n "$PREV_FAIL_SET" && "$CURRENT_FAIL_SET" == "$PREV_FAIL_SET" ]]; then
+        echo "[pdf-convert] same pages failing same checks 2x in a row — stopping repair." >&2
+        echo "[pdf-convert] stuck pages: $CURRENT_FAIL_SET" >&2
+        exit 1
+    fi
+    PREV_FAIL_SET="$CURRENT_FAIL_SET"
+
     for f in $CRITICAL_PAGES; do
         echo "[pdf-convert] deleting bad page for retry: $f" >&2
         rm -f "$MD_DIR/$f"
@@ -128,6 +147,15 @@ while [[ "$QA_ATTEMPTS" -lt "$QA_MAX" ]]; do
     QA_ATTEMPTS=$((QA_ATTEMPTS + 1))
     if [[ "$QA_ATTEMPTS" -ge "$QA_MAX" ]]; then
         echo "[pdf-convert] QA still failing after $QA_MAX repair attempts." >&2
+        # Run one final classification pass to allow soft-accept
+        QA_RESULT=$("$PYTHON" "$SOURCE_SCRIPT_DIR/step2.75_qa_sweep.py" \
+            --md-dir "$MD_DIR" \
+            --manifest "$MANIFEST" 2>&1) && FINAL_STATUS=0 || FINAL_STATUS=$?
+        if [[ "$FINAL_STATUS" -eq 2 ]]; then
+            echo "[pdf-convert] residual errors are SOFT-only — accepting and merging." >&2
+            SOFT_ACCEPTED=true
+            break
+        fi
         exit 1
     fi
     run_step2

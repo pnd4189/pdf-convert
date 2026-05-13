@@ -99,13 +99,21 @@ Thực hiện bằng driver tự động của Gemini CLI. Không dừng sau t�
 
 | Format | Docling Parse | Gemini Refine | Fast-Path | Notes |
 |--------|---------------|---------------|-----------|-------|
-| PDF (text) | ✅ full | ✅ | — | Streaming if >200 pages or >50MB (40-page batches) |
-| PDF (scanned) | ✅ RapidOCR | ✅ | — | OCR via Docling built-in; Gemini adds ADE grounding |
+| PDF (all) | ❌ bypassed | ✅ vision-only | render PNG → Gemini | Docling unreliable on OCR'd/scanned-like PDFs → always go vision-only |
 | DOCX | ✅ | ✅ | — | Full pipeline; each section = page |
 | PPTX | ✅ | ✅ | — | Each slide = page; title/body/image regions detected |
 | EPUB | ✅ | ✅ / ⏭ | ✅ text-only skip | Text-only chapters bypass Gemini (≥70% token saving) |
 | HTML | ✅ | ✅ | — | Inline images route through Gemini |
-| Image (PNG/JPG) | ✅ | ✅ | — | Single-page document |
+| Image (PNG/JPG/JPEG/GIF/WEBP/BMP/TIFF) | ❌ bypassed | ✅ vision-only | normalize → `0001.png` → Gemini | Pure pixel input — nothing for Docling structural extraction to add |
+
+**Why PDF and Image skip Docling (since 2026-05-13):** sparse Docling
+extraction on OCR'd PDFs caused `visual_audit` to flag every text page as an
+"uncovered visual region", which led the auto-repair loop to spin until
+exhausted. Standalone images are pure pixels — Docling adds zero structural
+signal. Both formats now go vision-only: normalize/render to PNG (300 DPI for
+PDFs) and let the active Gemini CLI model do full vision extraction directly.
+Docling stays load-bearing for DOCX/PPTX/EPUB where structural extraction is
+trustworthy.
 
 ## Known Limits
 
@@ -165,6 +173,8 @@ môi trường API-key/Vertex để ép subprocess dùng OAuth của Gemini CLI.
 
 **Fail-fast visual guardrail**:
 
-- `prepare_native_workspace.sh` tạo `native_manifest.json.visual_candidates` bằng cách so sánh PNG với bbox text/table từ Docling.
-- `step2.75_qa_sweep.py --manifest native_manifest.json` sẽ FAIL nếu trang có visual candidate nhưng Markdown thiếu mô tả `figure`/HTML table phù hợp.
-- QA cũng FAIL nếu trang nhắc tới hình/đồ/sơ đồ/biểu đồ nhưng thiếu `<:: mô tả chi tiết : figure ::>`.
+- Cho DOCX/PPTX/EPUB/HTML/Image: `prepare_native_workspace.sh` tạo `native_manifest.json.visual_candidates` bằng cách so sánh PNG với bbox text/table từ Docling.
+- Cho PDF: manifest set `skip_visual_audit=true` → bỏ check visual_candidate (không có Docling baseline đáng tin).
+- `step2.75_qa_sweep.py` exit code 0 (PASS) | 1 (HARD: anchor/box/table/vision-provenance — repair được) | 2 (SOFT-only: figure/keyword — caller có thể accept).
+- QA chỉ flag keyword khi có chỉ thị tham chiếu thị giác rõ ràng ("xem hình", "biểu đồ 2.3", "圖 3", "hình bên trái"...) — không match standalone "đồ"/"hình" trong văn xuôi chuyên môn.
+- `auto_convert.sh` auto-repair loop detect stuck pages (cùng failure 2 lần liên tiếp → dừng), accept SOFT-only failures và tiếp tục merge.

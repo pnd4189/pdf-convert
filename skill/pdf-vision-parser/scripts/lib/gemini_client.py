@@ -138,12 +138,34 @@ def detect_active_model() -> str:
 # Quota-exhausted detection: when these phrases appear in stderr we MUST stop
 # immediately. Retrying burns nothing useful (same per-account daily limit) and
 # delays the eventual halt. Caller catches QuotaExhaustedError and aborts cleanly.
+#
+# NOTE: "429" was removed — it matched too broadly (appeared in unrelated debug
+# output, timestamps, port numbers) and caused false-quota cascades. We now
+# require an explicit quota phrase. Real per-minute 429s from Gemini CLI always
+# include one of these phrases alongside the HTTP code.
 QUOTA_MARKERS = (
     "RESOURCE_EXHAUSTED",
     "QUOTA_EXHAUSTED",
     "quota will reset",
+    "quota exceeded",
     "rateLimitExceeded",
-    "429",
+    "Rate limit exceeded",
+    "Daily quota",
+    "Per-minute quota",
+)
+
+# Stderr phrases that look scary but are TRANSIENT vision/streaming hiccups —
+# never quota-related. If a failed call's stderr contains any of these AND no
+# QUOTA_MARKERS, we treat it as a transient retry-able failure (do not probe,
+# do not cascade). This stops the well-known "Invalid stream … empty response"
+# vision-API misbehavior from being misclassified as quota exhaustion.
+TRANSIENT_MARKERS = (
+    "Invalid stream",
+    "empty response",
+    "malformed tool call",
+    "MALFORMED_FUNCTION_CALL",
+    "INTERNAL",
+    "DEADLINE_EXCEEDED",
 )
 
 
@@ -154,6 +176,10 @@ class QuotaExhaustedError(RuntimeError):
 
 def _is_quota_error(stderr: str) -> bool:
     return any(marker in stderr for marker in QUOTA_MARKERS)
+
+
+def _is_transient_error(stderr: str) -> bool:
+    return any(marker in stderr for marker in TRANSIENT_MARKERS)
 
 
 # Env vars that, if present, push gemini CLI off the OAuth path onto API-key /
@@ -193,6 +219,13 @@ def _verify_quota_truly_exhausted(model: str) -> bool:
     Probe the model with a tiny no-op prompt to confirm quota is actually exhausted
     (not a transient 429 / misclassified error). Returns True only if probe also
     reports a quota marker. Uses OAuth env so probe matches main call path.
+
+    On probe FAILURE (timeout / CLI missing) we return FALSE — "cannot confirm"
+    must mean "treat as transient and let main loop retry." The previous default
+    of True caused a fatal cascade under load: an overloaded CLI made the probe
+    time out, which falsely marked the model exhausted, switched to the next
+    model, whose probe also timed out, until every known model was marked dead
+    and the pipeline halted even though no real quota event had occurred.
     """
     cmd = ["gemini", "-p", "ok"]
     if model:
@@ -207,8 +240,16 @@ def _verify_quota_truly_exhausted(model: str) -> bool:
             env=_build_oauth_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        # Treat probe failure as "cannot confirm" → assume exhausted to be safe.
-        return True
+        # Cannot confirm → assume transient. Main loop will retry; if quota is
+        # truly exhausted, the next call will return a real quota marker and
+        # we'll re-enter this path with a probe that completes.
+        print(
+            f"[gemini_client] quota-verify probe for {model or 'default'} "
+            f"could not complete — treating as transient, not exhausted.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
     return _is_quota_error(proc.stderr or "") or _is_quota_error(proc.stdout or "")
 
 
@@ -462,7 +503,15 @@ def call_gemini(
             # _handle_quota_exhaustion re-raises QuotaExhaustedError if user declines
             # or no alternative exists; otherwise it updates the cached model and we
             # transparently retry on the next loop iteration with the new -m value.
-            if _is_quota_error(stderr) or _is_quota_error(response):
+            #
+            # Short-circuit: if stderr explicitly names a transient vision/stream
+            # error and lacks any quota marker, skip the quota path entirely —
+            # those failures resolve with a plain retry; cascading to a different
+            # model on them just wastes the user's flash quota.
+            quota_hit = _is_quota_error(stderr) or _is_quota_error(response)
+            if quota_hit and _is_transient_error(stderr) and not _is_quota_error(stderr):
+                quota_hit = False
+            if quota_hit:
                 _handle_quota_exhaustion(active_model, stderr.strip()[:500] or "quota exhausted")
                 continue  # retry with new model now in _RESOLVED_MODEL_CACHE
 

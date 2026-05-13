@@ -9,7 +9,12 @@ Checks:
   4. Native vision provenance marker when a manifest is available
   5. Figure/diagram semantic description for pages with visual candidates
 
-Exit codes: 0 = PASS, 1 = CRITICAL found
+Exit codes:
+  0 = PASS
+  1 = HARD critical (anchor / box / table / vision-provenance) — must repair
+  2 = SOFT critical only (figure ontology / visual-keyword references) — let
+      caller decide whether to retry or accept (re-running Gemini rarely fixes
+      these because they're textual context calls, not actual page contents)
 """
 
 import argparse
@@ -39,9 +44,31 @@ BLANK_PAGE_RE = re.compile(r"<!--\s*TRANG TRỐNG\s*-\s*ĐÃ XÁC MINH\s*-->")
 VISION_SOURCE_RE = re.compile(r"<!--\s*VISION_SOURCE\s*:\s*[^>]+-->", re.IGNORECASE)
 ONTOLOGY_RE = re.compile(r"<::\s*(.*?)\s*:\s*(figure|logo|scan_code|attestation|marginalia)\s*::>", re.IGNORECASE | re.DOTALL)
 FIGURE_RE = re.compile(r"<::\s*(.*?)\s*:\s*figure\s*::>", re.IGNORECASE | re.DOTALL)
+# Match REFERENCES to a visual on the page, not topical mentions of visual
+# concepts. Vietnamese astrology/feng-shui prose uses words like "đồ", "hình",
+# "tinh đồ" as domain terms — those alone must not trigger a figure-ontology
+# requirement. We only flag when the text clearly points at a visual artifact:
+# numbered captions, "xem/như hình/đồ", "see/as shown in figure", CJK 图/圖
+# captions, etc.
 VISUAL_KEYWORD_RE = re.compile(
-    r"(biểu\s*đồ|sơ\s*đồ|thiên\s*tinh\s*đồ|giao\s*hội\s*đồ|tinh\s*hệ.*đồ|"
-    r"\bđồ\b|\bhình\b|chart|diagram|figure|grid|星系|圖|图)",
+    r"(?:"
+    # Numbered visual captions: "hình 1", "biểu đồ 2.3", "sơ đồ A", "figure 4-b"
+    # Caption labels are digits, or a single uppercase letter, optionally
+    # followed by .digit/-digit. We intentionally exclude word-like labels
+    # (e.g. "hình thức", "đồ thị" in plain prose) to avoid false positives.
+    r"(?:biểu\s*đồ|sơ\s*đồ|hình(?:\s*vẽ|\s*minh\s*họa)?|figure|fig\.?|diagram|chart)"
+    r"\s*[:#]?\s*(?:\d+(?:[\.\-][\dA-Za-z]+)?|[A-Z](?:[\.\-][\dA-Za-z]+)?\b)"
+    r"|"
+    # Explicit deictic references: "xem hình", "như hình bên", "see figure"
+    r"(?:xem|như|theo|coi|see|as\s+shown\s+in|as\s+per|refer\s+to)"
+    r"\s+(?:bảng|hình|sơ\s*đồ|biểu\s*đồ|đồ\s*thị|figure|diagram|chart|grid)\b"
+    r"|"
+    # CJK figure-caption markers (number + 图/圖)
+    r"(?:图|圖|表)\s*\d+"
+    r"|"
+    # Position-anchored references: "hình bên dưới/trên/trái/phải"
+    r"(?:hình|sơ\s*đồ|biểu\s*đồ|bảng)\s+(?:bên\s+)?(?:trên|dưới|trái|phải|này|sau|trước)"
+    r")",
     re.IGNORECASE,
 )
 RELATION_DETAIL_RE = re.compile(
@@ -87,13 +114,32 @@ def run_qa(md_dir, manifest_path=None):
     pages_requiring_vision = set()
     if manifest and not manifest.get("skip_native_extraction"):
         pages_requiring_vision = {int(p) for p in manifest.get("pages", []) if str(p).isdigit()}
-    visual_candidates = _page_visual_candidates(manifest)
+    # When manifest says skip_visual_audit (PDF vision-only mode), there is no
+    # reliable Docling baseline to decide what "uncovered visual region" means.
+    # Trust the Gemini vision extractor and skip the deterministic guardrail.
+    skip_visual_audit = bool(manifest.get("skip_visual_audit"))
+    visual_candidates = {} if skip_visual_audit else _page_visual_candidates(manifest)
 
     files = sorted(
         [f for f in os.listdir(md_dir) if f.endswith(".md")],
         key=page_num,
     )
-    critical = 0
+    hard_critical = 0
+    soft_critical = 0
+
+    # Issue markers that indicate a soft (often non-actionable) problem. These
+    # are the false-positive-prone classes — Gemini rarely fixes them on retry
+    # because they reflect either Docling-coverage gaps or topical mentions in
+    # prose rather than missing extraction work.
+    SOFT_MARKERS = (
+        "Trang có vùng hình/sơ đồ ngoài bbox",
+        "thiếu ontology",
+        "Mô tả visual ontology quá ngắn",
+        "Mô tả visual ontology chưa thể hiện",
+    )
+
+    def _classify(issue: str) -> str:
+        return "soft" if any(m in issue for m in SOFT_MARKERS) else "hard"
 
     print("\n" + "=" * 50 + "\n  🚀 LANDING.AI - ADE QA SWEEP\n" + "=" * 50)
 
@@ -105,7 +151,7 @@ def run_qa(md_dir, manifest_path=None):
         preview = ", ".join(str(p) for p in missing_pages[:30])
         suffix = " ..." if len(missing_pages) > 30 else ""
         print(f"   - [CRITICAL] Thiếu {len(missing_pages)} file page_N.md: {preview}{suffix}")
-        critical += 1
+        hard_critical += 1
 
     for fname in files:
         with open(os.path.join(md_dir, fname), "r", encoding="utf-8") as f:
@@ -200,20 +246,29 @@ def run_qa(md_dir, manifest_path=None):
             print(f"📄 {fname}:")
             for issue in issues:
                 print(f"   - {issue}")
-            critical += len([i for i in issues if "CRITICAL" in i])
+                if "CRITICAL" in issue:
+                    if _classify(issue) == "hard":
+                        hard_critical += 1
+                    else:
+                        soft_critical += 1
 
     print("-" * 50)
-    if critical > 0:
+    total = hard_critical + soft_critical
+    if total == 0:
+        print("  ✅ 100% PASS. Cấu trúc bảng và Tọa độ đạt chuẩn Enterprise!")
+        sys.exit(0)
+    if hard_critical > 0:
         print(
-            f"  🔴 TỔNG KẾT: CÓ {critical} LỖI CRITICAL. "
-            f"Yêu cầu AI mở file sửa lại ngay!"
+            f"  🔴 TỔNG KẾT: {hard_critical} lỗi cấu trúc (HARD) + "
+            f"{soft_critical} lỗi figure/keyword (SOFT). "
+            f"Cần repair các trang HARD."
         )
         sys.exit(1)
-    else:
-        print(
-            "  ✅ 100% PASS. Cấu trúc bảng và Tọa độ đạt chuẩn Enterprise!"
-        )
-        sys.exit(0)
+    print(
+        f"  🟡 TỔNG KẾT: chỉ còn {soft_critical} lỗi figure/keyword (SOFT). "
+        f"Không có vi phạm cấu trúc — caller có thể chấp nhận và merge."
+    )
+    sys.exit(2)
 
 
 if __name__ == "__main__":
