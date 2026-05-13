@@ -151,9 +151,17 @@ môi trường API-key/Vertex để ép subprocess dùng OAuth của Gemini CLI.
   Choose:
   ```
 - Lựa chọn của user chỉ áp dụng **trong process hiện tại** (in-memory `_RESOLVED_MODEL_CACHE`); không ghi vào `~/.gemini/settings.json`, không phá CLI session.
-- Nếu `/dev/tty` không khả dụng → ghi `QUOTA_PROMPT.json` vào workspace + exit để user resume bằng `GEMINI_MODEL=<chosen> /pdf-convert ...`.
-- Nếu user chọn `q` hoặc không còn model thay thế → terminal quota → giữ workspace để resume sau.
-- Mọi lần switch đều exclude các model đã exhausted khỏi list lần sau.
+- **Headless mode** (Gemini CLI extension slash-command, CI, redirected stdio — `/dev/tty` không khả dụng): tự động cascade sang model tiếp theo trong `discover_used_models()` (recency order), log decision rõ ràng:
+  ```
+  [gemini_client] ⚠️  HEADLESS context — /dev/tty unavailable.
+  [gemini_client]    Switching → gemini-3-flash-preview (most-recent unexhausted)
+  [gemini_client]    Remaining fallbacks: [gemini-2.5-pro]
+  [gemini_client]    To force a specific model on next run:
+  [gemini_client]      GEMINI_MODEL=<name> /pdf-convert ...
+  ```
+  Đồng thời ghi `QUOTA_PROMPT.json` vào workspace với field `auto_cascaded_to` để audit.
+- Nếu user chọn `q` (interactive) hoặc tất cả model đã exhausted (headless) → terminal quota → giữ workspace để resume sau.
+- Mọi lần switch (interactive hay auto-cascade) đều exclude các model đã exhausted khỏi list lần sau.
 
 **Fail-fast visual guardrail**:
 

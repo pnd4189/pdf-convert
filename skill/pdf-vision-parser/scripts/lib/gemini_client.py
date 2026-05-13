@@ -212,17 +212,30 @@ def _verify_quota_truly_exhausted(model: str) -> bool:
     return _is_quota_error(proc.stderr or "") or _is_quota_error(proc.stdout or "")
 
 
-def _write_quota_marker(workspace: Path, exhausted: str, candidates: list[str]) -> Path:
-    """Drop a JSON marker so user can resume by setting GEMINI_MODEL env var."""
+def _write_quota_marker(
+    workspace: Path,
+    exhausted: str,
+    candidates: list[str],
+    auto_cascaded_to: Optional[str] = None,
+) -> Path:
+    """
+    Drop a JSON marker recording the quota event so the user can audit headless
+    runs or resume manually with GEMINI_MODEL=<chosen>.
+    """
     marker = workspace / QUOTA_PROMPT_MARKER_NAME
     payload = {
         "exhausted_model": exhausted,
         "exhausted_so_far": sorted(_EXHAUSTED_MODELS | {exhausted}),
         "candidate_models": candidates,
+        "auto_cascaded_to": auto_cascaded_to,
         "instruction": (
-            "Stdin/tty unavailable for interactive prompt. "
-            "Pick one of candidate_models and re-run /pdf-convert with "
-            "GEMINI_MODEL=<chosen> to resume from this workspace."
+            f"Headless run auto-cascaded to '{auto_cascaded_to}'. "
+            f"To force a different model on resume: "
+            f"GEMINI_MODEL=<name> /pdf-convert ..."
+            if auto_cascaded_to
+            else "Stdin/tty unavailable for interactive prompt. "
+                 "Pick one of candidate_models and re-run /pdf-convert with "
+                 "GEMINI_MODEL=<chosen> to resume from this workspace."
         ),
     }
     try:
@@ -244,23 +257,48 @@ def _resolve_workspace_dir() -> Optional[Path]:
     return None
 
 
-def _prompt_model_switch(exhausted_model: str) -> Optional[str]:
+def _try_open_tty():
     """
-    Interactive: list user-known alternative models, read choice from /dev/tty.
-    Returns chosen model id, or None to terminate (user 'q' / no candidates / no tty).
-    Caller must hold _SWITCH_LOCK.
+    Open /dev/tty in r+ mode for interactive prompting. Returns the file handle
+    on success, or None if we are running headless (e.g. Gemini CLI extension
+    slash-command, CI, redirected stdio).
     """
-    all_known = discover_used_models()
-    candidates = [m for m in all_known if m != exhausted_model and m not in _EXHAUSTED_MODELS]
-
-    if not candidates:
-        print(
-            f"\n[gemini_client] ⛔ no alternative models found in your Gemini CLI history.\n"
-            f"[gemini_client]    Open `gemini` interactively, run /model to switch, then resume.\n",
-            file=sys.stderr,
-        )
+    try:
+        return open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+    except OSError:
         return None
 
+
+def _auto_cascade_pick(exhausted_model: str, candidates: list[str]) -> str:
+    """
+    Headless fallback: pick the most-recently-used unexhausted model from the
+    user's CLI session history. Logs the decision clearly so the user can audit
+    the chosen model after the headless run completes.
+    """
+    chosen = candidates[0]
+    print(
+        f"\n─────────────────────────────────────────────────────────\n"
+        f"[gemini_client] ⚠️  HEADLESS context — /dev/tty unavailable.\n"
+        f"[gemini_client]    Cannot prompt interactively, auto-cascading.\n"
+        f"[gemini_client]    Exhausted: {exhausted_model}\n"
+        f"[gemini_client]    Switching → {chosen}\n"
+        f"[gemini_client]    (most-recent unexhausted model in your CLI history)\n"
+        f"[gemini_client]    Remaining fallbacks if needed: {candidates[1:] or '(none)'}\n"
+        f"[gemini_client]    To force a specific model on next run:\n"
+        f"[gemini_client]      GEMINI_MODEL=<name> /pdf-convert ...\n"
+        f"─────────────────────────────────────────────────────────\n",
+        file=sys.stderr,
+        flush=True,
+    )
+    workspace = _resolve_workspace_dir()
+    if workspace:
+        marker = _write_quota_marker(workspace, exhausted_model, candidates, auto_cascaded_to=chosen)
+        print(f"[gemini_client]    Audit marker: {marker}\n", file=sys.stderr, flush=True)
+    return chosen
+
+
+def _prompt_via_tty(tty, exhausted_model: str, candidates: list[str]) -> Optional[str]:
+    """Interactive menu loop on an opened /dev/tty handle."""
     banner = (
         f"\n─────────────────────────────────────────────────────────\n"
         f"⚠️  QUOTA EXHAUSTED — model: {exhausted_model}\n"
@@ -269,25 +307,11 @@ def _prompt_model_switch(exhausted_model: str) -> Optional[str]:
         f"Pick a replacement model for the rest of this run\n"
         f"(in-memory only — your CLI's active model is NOT modified):\n"
     )
-    # Build menu text once, write to tty so worker stderr noise doesn't interleave.
     menu_lines = [banner]
     for i, m in enumerate(candidates, 1):
         menu_lines.append(f"  [{i}] {m}\n")
     menu_lines.append("  [q] Stop + keep workspace for resume\n")
     menu_lines.append("Choose: ")
-
-    try:
-        tty = open("/dev/tty", "r+", encoding="utf-8", buffering=1)
-    except OSError:
-        workspace = _resolve_workspace_dir()
-        print(
-            f"\n[gemini_client] ⚠️  /dev/tty unavailable — cannot prompt interactively.\n",
-            file=sys.stderr,
-        )
-        if workspace:
-            marker = _write_quota_marker(workspace, exhausted_model, candidates)
-            print(f"[gemini_client] wrote: {marker}", file=sys.stderr)
-        return None
 
     try:
         tty.write("".join(menu_lines))
@@ -312,6 +336,38 @@ def _prompt_model_switch(exhausted_model: str) -> Optional[str]:
         return None
     finally:
         tty.close()
+
+
+def _prompt_model_switch(exhausted_model: str) -> Optional[str]:
+    """
+    Pick a replacement model after quota exhaustion.
+
+    - Interactive context (TTY available): prompt user to pick from candidates.
+      Honors prior intent that user manually controls model selection.
+    - Headless context (TTY unavailable, e.g. Gemini CLI extension): auto-cascade
+      to the most-recent unexhausted model. Headless processes must never block
+      on interactive I/O, and stopping mid-pipeline is worse UX than picking the
+      next-most-recent model the user has demonstrably used.
+
+    Returns chosen model id, or None when no alternative exists.
+    Caller must hold _SWITCH_LOCK.
+    """
+    all_known = discover_used_models()
+    candidates = [m for m in all_known if m != exhausted_model and m not in _EXHAUSTED_MODELS]
+
+    if not candidates:
+        print(
+            f"\n[gemini_client] ⛔ no alternative models found in your Gemini CLI history.\n"
+            f"[gemini_client]    All known models exhausted: {sorted(_EXHAUSTED_MODELS | {exhausted_model})}\n"
+            f"[gemini_client]    Open `gemini` interactively, run /model to switch, then resume.\n",
+            file=sys.stderr,
+        )
+        return None
+
+    tty = _try_open_tty()
+    if tty is None:
+        return _auto_cascade_pick(exhausted_model, candidates)
+    return _prompt_via_tty(tty, exhausted_model, candidates)
 
 
 def _handle_quota_exhaustion(failing_model: str, stderr_msg: str) -> None:
@@ -359,7 +415,9 @@ def _handle_quota_exhaustion(failing_model: str, stderr_msg: str) -> None:
         if not chosen:
             _TERMINAL_QUOTA = True
             raise QuotaExhaustedError(
-                f"user declined model switch (exhausted: {sorted(_EXHAUSTED_MODELS)})"
+                f"no replacement model available — all known models exhausted: "
+                f"{sorted(_EXHAUSTED_MODELS)} "
+                f"(or user declined interactive switch)"
             )
 
         _RESOLVED_MODEL_CACHE = chosen
