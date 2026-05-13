@@ -3,7 +3,10 @@
 step2_gemini_refine.py — Per-page Gemini ADE refinement consuming Docling JSON + PNGs.
 
 Calls gemini CLI per page with structured Docling data + PNG → writes ADE Markdown.
-Concurrent calls capped at MAX_CONCURRENT (default 3) to respect rate limits.
+Pages processed in BATCH_SIZE chunks (default 10) with MAX_CONCURRENT workers per
+batch (default 3) and BATCH_DELAY_SECS pause between batches (default 5s) — spreads
+requests over time so we stay under Gemini per-minute RPM/TPM rate limits even on
+Ultra accounts where daily quota is large but per-minute caps still apply.
 Page-level caching: skips pages with existing valid output (resume capability).
 
 Usage:
@@ -13,15 +16,19 @@ Usage:
 import json
 import sys
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.gemini_client import call_gemini, QuotaExhaustedError
 
-# OAuth (Ultra) accounts have effectively no daily cap — keep concurrency at 3.
-# Lower to 1 if you're on a Free OAuth tier and need to stretch RPD.
+# Concurrency = workers per batch. Batching prevents firing all pages at once into
+# the executor queue, which on large PDFs can saturate per-minute Gemini quotas
+# (RPM/TPM) even when daily caps (RPD) are nowhere near exhausted on Ultra plans.
 MAX_CONCURRENT = int(os.environ.get("GEMINI_CONCURRENCY", "3"))
+BATCH_SIZE = int(os.environ.get("GEMINI_BATCH_SIZE", "10"))
+BATCH_DELAY_SECS = float(os.environ.get("GEMINI_BATCH_DELAY", "5"))
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "ade_prompt_v2.txt"
 VISION_PROMPT_PATH = Path(__file__).resolve().parent / "ade_prompt_vision.txt"
 VISION_THRESHOLD = int(os.environ.get("DOCLING_SPARSE_THRESHOLD", "8"))
@@ -133,6 +140,86 @@ def _check_gemini_available() -> None:
         sys.exit(1)
 
 
+def _run_batched(
+    pages: list[dict],
+    png_dir: Path,
+    out_dir: Path,
+    prompt_template: str,
+    vision_template: str,
+    label: str,
+) -> tuple[list[int], int, int, bool]:
+    """
+    Process pages in BATCH_SIZE chunks, each chunk drained by MAX_CONCURRENT workers.
+    Sleeps BATCH_DELAY_SECS between batches to spread RPM/TPM load.
+
+    Returns (failed_page_nos, ok_count, cached_count, quota_hit).
+    quota_hit=True aborts after the current batch; remaining pages stay uncached
+    so a resume run picks them up after the quota window resets.
+    """
+    failed: list[int] = []
+    ok_count = 0
+    cached_count = 0
+    quota_hit = False
+
+    total = len(pages)
+    n_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for batch_idx in range(n_batches):
+        start = batch_idx * BATCH_SIZE
+        batch = pages[start:start + BATCH_SIZE]
+        page_nos = [p.get("page_no") for p in batch]
+        print(
+            f"[step2] {label} batch {batch_idx+1}/{n_batches} "
+            f"(pages {page_nos[0]}..{page_nos[-1]}, size={len(batch)}, workers={MAX_CONCURRENT})",
+            file=sys.stderr,
+        )
+
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
+            futures = {
+                pool.submit(_process_page, page, png_dir, out_dir, prompt_template, vision_template): page.get("page_no")
+                for page in batch
+            }
+            for future in as_completed(futures):
+                try:
+                    page_no, status = future.result()
+                except QuotaExhaustedError as qe:
+                    quota_hit = True
+                    for f in futures:
+                        f.cancel()
+                    print(
+                        f"\n[step2] QUOTA EXHAUSTED (terminal) — halting. Reason: {qe}\n"
+                        f"[step2] Workspace preserved at {out_dir.parent} for resume.\n"
+                        f"[step2] To resume: re-run /pdf-convert (page-level cache will skip done pages).\n"
+                        f"[step2] You can also pre-pick a model via:\n"
+                        f"[step2]   GEMINI_MODEL=<model_id> /pdf-convert ...\n"
+                        f"[step2] or open `gemini`, switch model with /model, then re-run.",
+                        file=sys.stderr,
+                    )
+                    break
+                except Exception as e:
+                    print(f"[step2] UNEXPECTED thread error: {type(e).__name__}: {e}", file=sys.stderr)
+                    continue
+                if status == "failed":
+                    failed.append(page_no)
+                elif status == "cached":
+                    cached_count += 1
+                else:
+                    ok_count += 1
+                    print(f"[step2] page {page_no} ✓", file=sys.stderr, end="\r")
+
+        if quota_hit:
+            break
+
+        if batch_idx + 1 < n_batches and BATCH_DELAY_SECS > 0:
+            print(
+                f"[step2] batch {batch_idx+1} done — sleeping {BATCH_DELAY_SECS}s before next batch",
+                file=sys.stderr,
+            )
+            time.sleep(BATCH_DELAY_SECS)
+
+    return failed, ok_count, cached_count, quota_hit
+
+
 def main() -> None:
     if len(sys.argv) < 4:
         print("Usage: step2_gemini_refine.py <cache_json> <png_dir> <output_md_dir>", file=sys.stderr)
@@ -174,78 +261,37 @@ def main() -> None:
     prompt_template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
     vision_template = VISION_PROMPT_PATH.read_text(encoding="utf-8")
 
-    # Phase 1: process all pages (cached ones skipped)
-    print(f"[step2] processing {len(pages)} pages (concurrency={MAX_CONCURRENT})", file=sys.stderr)
+    # Phase 1: process all pages in batches (cached ones skipped inside _process_page)
+    print(
+        f"[step2] processing {len(pages)} pages "
+        f"(batch_size={BATCH_SIZE}, concurrency={MAX_CONCURRENT}, batch_delay={BATCH_DELAY_SECS}s)",
+        file=sys.stderr,
+    )
 
-    failed: list[int] = []
-    cached_count = 0
-    quota_hit = False
-
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
-        futures = {
-            pool.submit(_process_page, page, png_dir, out_dir, prompt_template, vision_template): page.get("page_no")
-            for page in pages
-        }
-        for future in as_completed(futures):
-            try:
-                page_no, status = future.result()
-            except QuotaExhaustedError as qe:
-                quota_hit = True
-                # Cancel still-pending futures; in-flight ones will finish naturally
-                for f in futures:
-                    f.cancel()
-                print(
-                    f"\n[step2] QUOTA EXHAUSTED (terminal) — halting. Reason: {qe}\n"
-                    f"[step2] Workspace preserved at {out_dir.parent} for resume.\n"
-                    f"[step2] To resume: re-run /pdf-convert (page-level cache will skip done pages).\n"
-                    f"[step2] You can also pre-pick a model via:\n"
-                    f"[step2]   GEMINI_MODEL=<model_id> /pdf-convert ...\n"
-                    f"[step2] or open `gemini`, switch model with /model, then re-run.",
-                    file=sys.stderr,
-                )
-                break
-            except Exception as e:
-                print(f"[step2] UNEXPECTED thread error: {type(e).__name__}: {e}", file=sys.stderr)
-                continue
-            if status == "failed":
-                failed.append(page_no)
-            elif status == "cached":
-                cached_count += 1
-            else:
-                print(f"[step2] page {page_no} ✓", file=sys.stderr, end="\r")
+    failed, ok_count, cached_count, quota_hit = _run_batched(
+        pages, png_dir, out_dir, prompt_template, vision_template, label="phase1"
+    )
 
     if quota_hit:
         sys.exit(2)
 
-    print(f"\n[step2] phase 1 done — {len(pages) - len(failed)}/{len(pages)} ok ({cached_count} cached)", file=sys.stderr)
+    print(
+        f"\n[step2] phase 1 done — {len(pages) - len(failed)}/{len(pages)} ok "
+        f"({cached_count} cached, {ok_count} fresh)",
+        file=sys.stderr,
+    )
 
-    # Phase 2: retry failed pages
+    # Phase 2: retry failed pages (still batched, same pacing)
     for retry in range(RETRY_MAX):
         if not failed:
             break
         print(f"[step2] retry {retry+1}/{RETRY_MAX} for {len(failed)} failed pages: {sorted(failed)}", file=sys.stderr)
         retry_pages = [p for p in pages if p.get("page_no") in failed]
-        retry_failed: list[int] = []
-
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as pool:
-            futures = {
-                pool.submit(_process_page, page, png_dir, out_dir, prompt_template, vision_template): page.get("page_no")
-                for page in retry_pages
-            }
-            for future in as_completed(futures):
-                try:
-                    page_no, status = future.result()
-                except QuotaExhaustedError as qe:
-                    for f in futures:
-                        f.cancel()
-                    print(f"\n[step2] QUOTA EXHAUSTED during retry — halting. {qe}", file=sys.stderr)
-                    sys.exit(2)
-                except Exception:
-                    continue
-                if status == "failed":
-                    retry_failed.append(page_no)
-                else:
-                    print(f"[step2] page {page_no} ✓ (retry {retry+1})", file=sys.stderr)
+        retry_failed, _, _, retry_quota_hit = _run_batched(
+            retry_pages, png_dir, out_dir, prompt_template, vision_template, label=f"retry{retry+1}"
+        )
+        if retry_quota_hit:
+            sys.exit(2)
         failed = retry_failed
 
     # Final summary
