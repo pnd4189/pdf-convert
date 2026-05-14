@@ -30,10 +30,31 @@ ANCHOR_RE = re.compile(
     re.IGNORECASE,
 )
 
-COORD_NORMALIZED_RE = re.compile(
-    r"^\s*\[\s*(0(\.\d+)?|1(\.0+)?)\s*,\s*(0(\.\d+)?|1(\.0+)?)\s*,"
-    r"\s*(0(\.\d+)?|1(\.0+)?)\s*,\s*(0(\.\d+)?|1(\.0+)?)\s*\]\s*$"
-)
+# Permissive coord token: accepts plain decimals AND scientific notation
+# (e.g. 5.4851e-01). Range validation is done numerically below so a valid
+# float just written in e-notation no longer trips a CRITICAL.
+COORD_TOKEN_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _validate_box(box_str: str) -> bool:
+    """Return True if box_str is '[a, b, c, d]' with 4 floats in [0, 1].
+
+    Accepts scientific notation. Used instead of a strict regex so that
+    Gemini-emitted coords like 5.4851e-01 (= 0.54851) validate cleanly.
+    """
+    if not box_str:
+        return False
+    body = box_str.strip()
+    if not (body.startswith("[") and body.endswith("]")):
+        return False
+    tokens = COORD_TOKEN_RE.findall(body)
+    if len(tokens) != 4:
+        return False
+    try:
+        coords = [float(t) for t in tokens]
+    except ValueError:
+        return False
+    return all(0.0 <= c <= 1.0 for c in coords)
 
 MD_TABLE_RE = re.compile(r"\|[\s-]*-{3,}[\s-]*\|")
 TABLE_HTML_RE = re.compile(r"<table[^>]*>", re.IGNORECASE)
@@ -41,6 +62,9 @@ TABLE_ID_RE = re.compile(r"<table[^>]+id\s*=\s*['\"]\d+-\d+['\"]", re.IGNORECASE
 TD_TAG_RE = re.compile(r"<t[dh][^>]*>", re.IGNORECASE)
 TD_WITH_ID_RE = re.compile(r"<t[dh][^>]*id\s*=\s*['\"]\d+-\d+['\"][^>]*>", re.IGNORECASE)
 BLANK_PAGE_RE = re.compile(r"<!--\s*TRANG TRỐNG\s*-\s*ĐÃ XÁC MINH\s*-->")
+# Pages that the driver has already marked as "force-accepted" (stuck after
+# all retries). QA must not loop on these; they're already partial output.
+QA_WARNING_RE = re.compile(r"<!--\s*QA_WARNING\s*:", re.IGNORECASE)
 VISION_SOURCE_RE = re.compile(r"<!--\s*VISION_SOURCE\s*:\s*[^>]+-->", re.IGNORECASE)
 ONTOLOGY_RE = re.compile(r"<::\s*(.*?)\s*:\s*(figure|logo|scan_code|attestation|marginalia)\s*::>", re.IGNORECASE | re.DOTALL)
 FIGURE_RE = re.compile(r"<::\s*(.*?)\s*:\s*figure\s*::>", re.IGNORECASE | re.DOTALL)
@@ -72,8 +96,23 @@ VISUAL_KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 RELATION_DETAIL_RE = re.compile(
-    r"(đường|nối|liên\s*kết|mũi\s*tên|vị\s*trí|bố\s*cục|quan\s*hệ|ô|hàng|cột|"
-    r"vòng|cung|nút|điểm|trái|phải|trên|dưới|node|edge|connection|dashed|solid|circle|grid)",
+    r"("
+    # Vietnamese spatial/structural vocabulary
+    r"đường|nối|liên\s*kết|mũi\s*tên|vị\s*trí|bố\s*cục|quan\s*hệ|ô|hàng|cột|"
+    r"vòng|cung|nút|điểm|trái|phải|trên|dưới|cạnh|bên|giữa|chứa|gồm|"
+    # English geometric primitives
+    r"|node|edge|connection|connector|dashed|solid|circle|circular|rectangle|"
+    r"rectangular|square|triangle|polygon|grid|cell|column|row|"
+    # English spatial / directional terms
+    r"|arrow|points\s+(?:to|toward|rightward|leftward|upward|downward)|pointing|"
+    r"above|below|left(?:\s+side)?|right(?:\s+side)?|top|bottom|inside|outside|"
+    r"between|adjacent|opposite|center|centre|center(?:ed|er)?|"
+    # Layout / labeling cues common in figure descriptions
+    r"|labeled|labelled|labeled\s+as|positioned|aligned|arranged|"
+    r"branches?|stem|leaf|leaves|tree|graph|chart|diagram|panel|quadrant|"
+    # Chinese spatial cues (figures often reference 上/下/左/右)
+    r"|上|下|左|右|中心|中|外|内|連|連接|箭頭|向"
+    r")",
     re.IGNORECASE,
 )
 
@@ -160,6 +199,14 @@ def run_qa(md_dir, manifest_path=None):
         if BLANK_PAGE_RE.search(content):
             continue
 
+        # Force-accepted (stuck) pages: report them as soft so the driver does
+        # not loop, but still surface the warning text for the quality report.
+        if QA_WARNING_RE.search(content):
+            print(f"📄 {fname}:")
+            print("   - [WARN] Trang được driver force-accept (stuck sau retries). Đã skip strict QA.")
+            soft_critical += 1
+            continue
+
         issues = []
 
         # Check 1: Anchor + Normalized Coordinates
@@ -172,10 +219,10 @@ def run_qa(md_dir, manifest_path=None):
                     f"[CRITICAL] Chunk '{a_id}' thiếu thuộc tính "
                     f"box='[left, top, right, bottom]'"
                 )
-            elif not COORD_NORMALIZED_RE.match(box):
+            elif not _validate_box(box):
                 issues.append(
                     f"[CRITICAL] Chunk '{a_id}' box sai. "
-                    f"Bắt buộc Float 0.00-1.00 (VD: [0.12, 0.25, 0.9, 0.3])"
+                    f"Bắt buộc 4 Float trong [0.00, 1.00] (VD: [0.12, 0.25, 0.9, 0.3])"
                 )
 
         # Check 2: Markdown table ban

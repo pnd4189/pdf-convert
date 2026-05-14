@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.gemini_client import call_gemini, QuotaExhaustedError
+from lib.md_sanitizer import normalize_box_coords
 
 # Concurrency = workers per batch. Batching prevents firing all pages at once into
 # the executor queue, which on large PDFs can saturate per-minute Gemini quotas
@@ -116,6 +117,10 @@ def _process_page(
 
     try:
         response = call_gemini(prompt, image_path=image_arg)
+        # Normalize box coords (scientific notation → plain decimals) before
+        # writing. Gemini occasionally emits 5.4851e-01; downstream QA + merge
+        # expect plain [0.00, 1.00] floats. This is idempotent for clean output.
+        response = normalize_box_coords(response)
         out_path.write_text(response, encoding="utf-8")
         return page_no, "ok"
     except QuotaExhaustedError:
