@@ -18,7 +18,7 @@ Zero-hallucination does not permit skipping visible diagrams. If a visual struct
 
 ## ANCHOR FORMAT
 Before EVERY element (paragraph, heading, figure, table) insert:
-`<a id='{page_no}-{seq}' box='[left, top, right, bottom]'></a>`
+`<a id='{page_no}-{{seq}}' box='[left, top, right, bottom]'></a>`
 - Coordinates: 4 normalized floats [0.00–1.00] relative to page width/height
 - Use Docling bbox values when provided; refine with visual inspection if needed
 - ID sequence is zero-based per page: {page_no}-1, {page_no}-2, {page_no}-3 ...

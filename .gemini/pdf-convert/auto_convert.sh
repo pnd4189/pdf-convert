@@ -107,6 +107,28 @@ QA_ATTEMPTS=0
 QA_MAX="${PDF_CONVERT_QA_MAX:-3}"
 PREV_FAIL_SET=""
 SOFT_ACCEPTED=false
+FORCE_ACCEPTED_PAGES=""
+
+# force_accept_stuck: rewrite the given page_*.md files with QA_WARNING markers
+# so step3_merge can produce a valid output even when the model cannot satisfy
+# strict ADE checks (e.g. blurry scan, repeating model output). Pages stay in
+# the output with a clear warning the quality report surfaces to the user.
+force_accept_stuck() {
+    local reasons="$1"
+    shift
+    local files=("$@")
+    if [[ ${#files[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo "[pdf-convert] force-accepting ${#files[@]} stuck page(s): ${files[*]}" >&2
+    "$PYTHON" "$SOURCE_SCRIPT_DIR/force_accept_pages.py" \
+        --md-dir "$MD_DIR" \
+        --png-dir "$PNG_DIR" \
+        --reasons "$reasons" \
+        "${files[@]}" || true
+    FORCE_ACCEPTED_PAGES="$FORCE_ACCEPTED_PAGES ${files[*]}"
+}
+
 while [[ "$QA_ATTEMPTS" -lt "$QA_MAX" ]]; do
     QA_RESULT=$("$PYTHON" "$SOURCE_SCRIPT_DIR/step2.75_qa_sweep.py" \
         --md-dir "$MD_DIR" \
@@ -125,17 +147,25 @@ while [[ "$QA_ATTEMPTS" -lt "$QA_MAX" ]]; do
 
     CRITICAL_PAGES=$(printf '%s\n' "$QA_RESULT" | grep -oP 'page_\d+\.md' | sort -u || true)
     if [[ -z "$CRITICAL_PAGES" || "$SKIP_NATIVE" == "true" ]]; then
-        echo "[pdf-convert] QA failed and cannot auto-repair safely." >&2
-        exit 1
+        echo "[pdf-convert] QA failed and cannot auto-repair safely — force-accepting remaining pages." >&2
+        # Even here we prefer to ship partial output rather than block; the
+        # quality report will flag any residual issues for the user.
+        break
     fi
 
     # Stuck-page detection: if the failing set is unchanged since last attempt,
-    # repair won't help (Gemini will re-emit the same Markdown). Stop deleting.
+    # repair won't help (Gemini will re-emit the same Markdown). Switch to
+    # force-accept mode for these pages so the pipeline still produces output.
     CURRENT_FAIL_SET=$(printf '%s\n' $CRITICAL_PAGES | sort -u | tr '\n' ' ')
     if [[ -n "$PREV_FAIL_SET" && "$CURRENT_FAIL_SET" == "$PREV_FAIL_SET" ]]; then
-        echo "[pdf-convert] same pages failing same checks 2x in a row — stopping repair." >&2
-        echo "[pdf-convert] stuck pages: $CURRENT_FAIL_SET" >&2
-        exit 1
+        echo "[pdf-convert] same pages failing same checks 2x in a row — force-accepting." >&2
+        # Extract a compact reason string from the QA report for the affected pages
+        REASONS=$(printf '%s\n' "$QA_RESULT" | grep -E '\[CRITICAL\]' | head -4 | tr '\n' '|' | sed 's/|$//')
+        # shellcheck disable=SC2206
+        STUCK_FILES=( $CRITICAL_PAGES )
+        force_accept_stuck "${REASONS:-stuck after retries}" "${STUCK_FILES[@]}"
+        SOFT_ACCEPTED=true
+        break
     fi
     PREV_FAIL_SET="$CURRENT_FAIL_SET"
 
@@ -146,17 +176,26 @@ while [[ "$QA_ATTEMPTS" -lt "$QA_MAX" ]]; do
 
     QA_ATTEMPTS=$((QA_ATTEMPTS + 1))
     if [[ "$QA_ATTEMPTS" -ge "$QA_MAX" ]]; then
-        echo "[pdf-convert] QA still failing after $QA_MAX repair attempts." >&2
-        # Run one final classification pass to allow soft-accept
-        QA_RESULT=$("$PYTHON" "$SOURCE_SCRIPT_DIR/step2.75_qa_sweep.py" \
+        echo "[pdf-convert] QA still failing after $QA_MAX repair attempts — force-accepting remaining stuck pages." >&2
+        # Re-run step2 once more so re-deleted pages are at least attempted, then force-accept.
+        run_step2 || true
+        FINAL_QA=$("$PYTHON" "$SOURCE_SCRIPT_DIR/step2.75_qa_sweep.py" \
             --md-dir "$MD_DIR" \
             --manifest "$MANIFEST" 2>&1) && FINAL_STATUS=0 || FINAL_STATUS=$?
-        if [[ "$FINAL_STATUS" -eq 2 ]]; then
-            echo "[pdf-convert] residual errors are SOFT-only — accepting and merging." >&2
+        printf '%s\n' "$FINAL_QA" >&2
+        if [[ "$FINAL_STATUS" -eq 0 || "$FINAL_STATUS" -eq 2 ]]; then
             SOFT_ACCEPTED=true
             break
         fi
-        exit 1
+        REMAINING_PAGES=$(printf '%s\n' "$FINAL_QA" | grep -oP 'page_\d+\.md' | sort -u || true)
+        if [[ -n "$REMAINING_PAGES" ]]; then
+            REASONS=$(printf '%s\n' "$FINAL_QA" | grep -E '\[CRITICAL\]' | head -4 | tr '\n' '|' | sed 's/|$//')
+            # shellcheck disable=SC2206
+            STUCK_FILES=( $REMAINING_PAGES )
+            force_accept_stuck "${REASONS:-residual critical after ${QA_MAX} attempts}" "${STUCK_FILES[@]}"
+        fi
+        SOFT_ACCEPTED=true
+        break
     fi
     run_step2
 done
@@ -167,5 +206,19 @@ echo "[pdf-convert] STEP 3: merge JSON" >&2
     --md-dir "$MD_DIR" \
     --docling-cache "$CACHE_JSON"
 
+echo "[pdf-convert] STEP 4: quality report" >&2
+"$PYTHON" "$SOURCE_SCRIPT_DIR/step4_quality_report.py" \
+    --md-dir "$MD_DIR" \
+    --manifest "$MANIFEST" \
+    --output-json "$OUTPUT_JSON" || true
+
+echo "[pdf-convert] STEP 4b: model-attribution report" >&2
+"$PYTHON" "$SOURCE_SCRIPT_DIR/generate_quality_report.py" \
+    --workspace "$WORKSPACE" \
+    --model "${GEMINI_MODEL:-}" || true
+
 PIPELINE_SUCCESS=true
 echo "[pdf-convert] DONE: $OUTPUT_JSON" >&2
+if [[ -n "${FORCE_ACCEPTED_PAGES// /}" ]]; then
+    echo "[pdf-convert] NOTE: force-accepted pages (review recommended):$FORCE_ACCEPTED_PAGES" >&2
+fi

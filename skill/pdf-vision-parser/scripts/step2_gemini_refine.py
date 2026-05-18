@@ -3,16 +3,17 @@
 step2_gemini_refine.py — Per-page Gemini ADE refinement consuming Docling JSON + PNGs.
 
 Calls gemini CLI per page with structured Docling data + PNG → writes ADE Markdown.
-Pages processed in BATCH_SIZE chunks (default 10) with MAX_CONCURRENT workers per
-batch (default 3) and BATCH_DELAY_SECS pause between batches (default 5s) — spreads
-requests over time so we stay under Gemini per-minute RPM/TPM rate limits even on
-Ultra accounts where daily quota is large but per-minute caps still apply.
+Throttle (concurrency + batch size) auto-tunes from the resolved Gemini model:
+preview Pro → 1/3, GA Pro → 2/3, other → 3/10. Override via --concurrency /
+--batch-size CLI args or PDF_CONVERT_CONCURRENCY / PDF_CONVERT_BATCH_SIZE env.
 Page-level caching: skips pages with existing valid output (resume capability).
 
 Usage:
     python step2_gemini_refine.py <cache_json> <png_dir> <output_md_dir>
+                                   [--concurrency N] [--batch-size N]
 """
 
+import argparse
 import json
 import sys
 import os
@@ -21,15 +22,50 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.gemini_client import call_gemini, QuotaExhaustedError
+from lib.gemini_client import call_gemini, QuotaExhaustedError, detect_active_model
 from lib.md_sanitizer import normalize_box_coords
+from lib.model_registry import is_preview, model_tier
 
-# Concurrency = workers per batch. Batching prevents firing all pages at once into
-# the executor queue, which on large PDFs can saturate per-minute Gemini quotas
-# (RPM/TPM) even when daily caps (RPD) are nowhere near exhausted on Ultra plans.
-MAX_CONCURRENT = int(os.environ.get("GEMINI_CONCURRENCY", "3"))
-BATCH_SIZE = int(os.environ.get("GEMINI_BATCH_SIZE", "10"))
 BATCH_DELAY_SECS = float(os.environ.get("GEMINI_BATCH_DELAY", "5"))
+
+# Resolved at runtime via resolve_throttle(); placeholder defaults match the
+# pre-Phase-04 behavior so _run_batched can be imported standalone in tests.
+MAX_CONCURRENT = 3
+BATCH_SIZE = 10
+
+
+def _auto_throttle(model: str) -> tuple[int, int]:
+    """Safe (concurrency, batch_size) defaults for a resolved model."""
+    if not model:
+        return (3, 10)
+    if is_preview(model):
+        return (1, 3)
+    if model_tier(model) == "pro":
+        return (2, 3)
+    return (3, 10)
+
+
+def resolve_throttle(args, env) -> tuple[int, int]:
+    """CLI args → env vars → auto-tune by model tier. Logs the choice."""
+    model = detect_active_model()
+    auto_c, auto_b = _auto_throttle(model)
+
+    concurrency = (
+        args.concurrency
+        or int(env.get("PDF_CONVERT_CONCURRENCY", "0") or 0)
+        or auto_c
+    )
+    batch = (
+        args.batch_size
+        or int(env.get("PDF_CONVERT_BATCH_SIZE", "0") or 0)
+        or auto_b
+    )
+    print(
+        f"[step2] throttle: concurrency={concurrency} batch={batch} "
+        f"(auto for {model or 'cli-default'}: {auto_c}/{auto_b})",
+        flush=True,
+    )
+    return concurrency, batch
 PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent / "ade_prompt_v2.txt"
 VISION_PROMPT_PATH = Path(__file__).resolve().parent / "ade_prompt_vision.txt"
 VISION_THRESHOLD = int(os.environ.get("DOCLING_SPARSE_THRESHOLD", "8"))
@@ -226,9 +262,22 @@ def _run_batched(
 
 
 def main() -> None:
-    if len(sys.argv) < 4:
-        print("Usage: step2_gemini_refine.py <cache_json> <png_dir> <output_md_dir>", file=sys.stderr)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        prog="step2_gemini_refine",
+        description="Per-page Gemini ADE refinement (Docling JSON + PNGs → ADE Markdown).",
+    )
+    parser.add_argument("cache_json", help="Docling cache JSON path")
+    parser.add_argument("png_dir", help="Directory of per-page PNGs (NNNN.png)")
+    parser.add_argument("out_dir", help="Output directory for page_N.md files")
+    parser.add_argument(
+        "--concurrency", type=int, default=None,
+        help="Workers per batch (overrides auto-tune by model tier)",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Pages per batch (overrides auto-tune by model tier)",
+    )
+    args = parser.parse_args()
 
     if os.environ.get("PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS") != "1":
         print(
@@ -242,9 +291,12 @@ def main() -> None:
 
     _check_gemini_available()
 
-    cache_json_path = sys.argv[1]
-    png_dir = Path(sys.argv[2])
-    out_dir = Path(sys.argv[3])
+    global MAX_CONCURRENT, BATCH_SIZE
+    MAX_CONCURRENT, BATCH_SIZE = resolve_throttle(args, os.environ)
+
+    cache_json_path = args.cache_json
+    png_dir = Path(args.png_dir)
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with open(cache_json_path, "r", encoding="utf-8") as f:

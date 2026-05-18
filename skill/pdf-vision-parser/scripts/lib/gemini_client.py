@@ -8,15 +8,20 @@ with a slightly varied prompt suffix to break repetition.
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from .model_registry import discover_used_models
+from .model_registry import (
+    discover_used_models,
+    rank_pro_candidates,
+    model_tier,
+)
 
 MIN_RESPONSE_CHARS = 50
 MAX_RETRIES = 3
@@ -24,6 +29,12 @@ CALL_TIMEOUT_SECS = 120
 RETRY_BACKOFF_SECS = [2, 5, 10]
 QUOTA_VERIFY_TIMEOUT_SECS = 30
 QUOTA_PROMPT_MARKER_NAME = "QUOTA_PROMPT.json"
+
+# Probe ladder for strongest-Pro auto-detect. Top-2 ranked Pro models that
+# pass a startup liveness probe; populated once per process. Phase 03 reads
+# this to cascade Pro→Pro on confirmed RPD without re-probing.
+PROBE_TIMEOUT_SECS = 20
+_PRO_LADDER: list[str] = []
 
 GEMINI_HOME = Path(os.environ.get("GEMINI_HOME", str(Path.home() / ".gemini")))
 # Regex captures any "model":"gemini-..." occurrence in session logs / settings.
@@ -103,13 +114,76 @@ def _scan_recent_session_model() -> str:
     return ""
 
 
+def _probe_model_alive(model: str) -> bool:
+    """
+    Liveness check: does `gemini -p ok -m <model>` return cleanly?
+    Used by both startup probe ladder and phase-03 RPD verification.
+    Quota / permission / not-found in stderr → not alive.
+    """
+    cmd = ["gemini", "-p", "ok", "-m", model, "--yolo"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECS,
+            env=_build_oauth_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    if proc.returncode != 0:
+        return False
+    blob = (proc.stderr or "") + (proc.stdout or "")
+    if _is_quota_error(blob):
+        return False
+    if "PERMISSION_DENIED" in blob or "NOT_FOUND" in blob:
+        return False
+    return True
+
+
+def strongest_pro_available() -> str:
+    """
+    Probe top-2 Pro candidates from the user's CLI history; cache them in
+    _PRO_LADDER for phase-03 cascade; return the strongest that responds.
+    Returns "" if no Pro model in history responds.
+    """
+    global _PRO_LADDER
+    history = discover_used_models()
+    ranked = rank_pro_candidates(history)
+    if not ranked:
+        print("[gemini_client] no Pro models in CLI history.", flush=True)
+        _PRO_LADDER = []
+        return ""
+    print(
+        f"[gemini_client] Pro candidates (strongest first): {ranked}",
+        flush=True,
+    )
+    ladder: list[str] = []
+    primary = ""
+    for m in ranked[:2]:
+        print(
+            f"[gemini_client]   probing {m} (timeout {PROBE_TIMEOUT_SECS}s)...",
+            flush=True,
+        )
+        if _probe_model_alive(m):
+            print(f"[gemini_client]   {m} → OK", flush=True)
+            ladder.append(m)
+            if not primary:
+                primary = m
+        else:
+            print(f"[gemini_client]   {m} → unavailable", flush=True)
+    _PRO_LADDER = ladder
+    return primary
+
+
 def detect_active_model() -> str:
     """
     Resolve which model to pass to `gemini -p`. Priority:
-      1. GEMINI_MODEL env var (explicit override)
-      2. ~/.gemini/settings.json `model` field (persistent pin)
-      3. Most-recent non-empty session log (the "currently running" model)
-      4. "" → omit -m, let CLI use its built-in default
+      1. GEMINI_MODEL env var (explicit override, no probe)
+      2. strongest_pro_available() — auto-detect strongest Pro in history
+      3. ~/.gemini/settings.json `model` field (persistent pin)
+      4. Most-recent non-empty session log
+      5. "" → omit -m, let CLI use its built-in default
     Result is cached for the process lifetime.
     """
     global _RESOLVED_MODEL_CACHE
@@ -117,10 +191,13 @@ def detect_active_model() -> str:
         return _RESOLVED_MODEL_CACHE
 
     chosen = os.environ.get("GEMINI_MODEL", "").strip()
-    source = "env"
+    source = "env GEMINI_MODEL"
+    if not chosen:
+        chosen = strongest_pro_available()
+        source = "strongest Pro auto-detect"
     if not chosen:
         chosen = _read_settings_model()
-        source = "settings.json"
+        source = "~/.gemini/settings.json"
     if not chosen:
         chosen = _scan_recent_session_model()
         source = "recent session"
@@ -135,24 +212,51 @@ def detect_active_model() -> str:
     _RESOLVED_MODEL_CACHE = chosen
     return chosen
 
-# Quota-exhausted detection: when these phrases appear in stderr we MUST stop
-# immediately. Retrying burns nothing useful (same per-account daily limit) and
-# delays the eventual halt. Caller catches QuotaExhaustedError and aborts cleanly.
-#
-# NOTE: "429" was removed — it matched too broadly (appeared in unrelated debug
-# output, timestamps, port numbers) and caused false-quota cascades. We now
-# require an explicit quota phrase. Real per-minute 429s from Gemini CLI always
-# include one of these phrases alongside the HTTP code.
-QUOTA_MARKERS = (
-    "RESOURCE_EXHAUSTED",
-    "QUOTA_EXHAUSTED",
-    "quota will reset",
-    "quota exceeded",
+# Quota classification — RPM (per-minute, transient) vs RPD (per-day, terminal).
+# Conflating the two caused the original bug: an RPM burst was misread as RPD
+# exhaustion and triggered Pro→Flash cascade. We now match each kind separately
+# and bias ambiguous "RESOURCE_EXHAUSTED" hits toward RPM (safe — backoff and
+# retry the same model rather than degrading quality).
+RPM_MARKERS = (
+    "Per-minute quota",
+    "Quota exceeded for quota metric 'Requests per minute",
     "rateLimitExceeded",
     "Rate limit exceeded",
-    "Daily quota",
-    "Per-minute quota",
 )
+RPD_MARKERS = (
+    "Daily quota",
+    "Quota exceeded for quota metric 'Requests per day",
+    "quota will reset",
+)
+GENERIC_QUOTA_MARKERS = (
+    "RESOURCE_EXHAUSTED",
+    "QUOTA_EXHAUSTED",
+    "quota exceeded",
+)
+# Combined view for any-quota detection (probe rejection, main-loop classify).
+QUOTA_MARKERS = RPM_MARKERS + RPD_MARKERS + GENERIC_QUOTA_MARKERS
+
+# RPM backoff parameters — wait roughly one rate-limit window before retrying
+# the same model. 90s base + 0–30s jitter avoids thundering-herd across workers.
+RPM_BACKOFF_BASE_SECS = 90
+RPM_BACKOFF_JITTER_SECS = 30
+RPM_MAX_RETRIES = 5
+
+# RPD verification — 3 probes spaced 120s apart. Any single OK probe means
+# the original failure was lingering RPM, not daily exhaustion.
+RPD_PROBE_COUNT = 3
+RPD_PROBE_INTERVAL_SECS = 120
+
+
+def classify_quota_error(stderr: str) -> Literal["none", "rpm", "rpd", "ambiguous"]:
+    """Bucket a stderr blob. Ambiguous → caller treats as RPM (safe)."""
+    if any(m in stderr for m in RPD_MARKERS):
+        return "rpd"
+    if any(m in stderr for m in RPM_MARKERS):
+        return "rpm"
+    if any(m in stderr for m in GENERIC_QUOTA_MARKERS):
+        return "ambiguous"
+    return "none"
 
 # Stderr phrases that look scary but are TRANSIENT vision/streaming hiccups —
 # never quota-related. If a failed call's stderr contains any of these AND no
@@ -214,45 +318,6 @@ def _build_oauth_env() -> dict:
     return env
 
 
-def _verify_quota_truly_exhausted(model: str) -> bool:
-    """
-    Probe the model with a tiny no-op prompt to confirm quota is actually exhausted
-    (not a transient 429 / misclassified error). Returns True only if probe also
-    reports a quota marker. Uses OAuth env so probe matches main call path.
-
-    On probe FAILURE (timeout / CLI missing) we return FALSE — "cannot confirm"
-    must mean "treat as transient and let main loop retry." The previous default
-    of True caused a fatal cascade under load: an overloaded CLI made the probe
-    time out, which falsely marked the model exhausted, switched to the next
-    model, whose probe also timed out, until every known model was marked dead
-    and the pipeline halted even though no real quota event had occurred.
-    """
-    cmd = ["gemini", "-p", "ok"]
-    if model:
-        cmd += ["-m", model]
-    cmd += ["--yolo"]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=QUOTA_VERIFY_TIMEOUT_SECS,
-            env=_build_oauth_env(),
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        # Cannot confirm → assume transient. Main loop will retry; if quota is
-        # truly exhausted, the next call will return a real quota marker and
-        # we'll re-enter this path with a probe that completes.
-        print(
-            f"[gemini_client] quota-verify probe for {model or 'default'} "
-            f"could not complete — treating as transient, not exhausted.",
-            file=sys.stderr,
-            flush=True,
-        )
-        return False
-    return _is_quota_error(proc.stderr or "") or _is_quota_error(proc.stdout or "")
-
-
 def _write_quota_marker(
     workspace: Path,
     exhausted: str,
@@ -298,171 +363,140 @@ def _resolve_workspace_dir() -> Optional[Path]:
     return None
 
 
-def _try_open_tty():
-    """
-    Open /dev/tty in r+ mode for interactive prompting. Returns the file handle
-    on success, or None if we are running headless (e.g. Gemini CLI extension
-    slash-command, CI, redirected stdio).
-    """
-    try:
-        return open("/dev/tty", "r+", encoding="utf-8", buffering=1)
-    except OSError:
-        return None
-
-
-def _auto_cascade_pick(exhausted_model: str, candidates: list[str]) -> str:
-    """
-    Headless fallback: pick the most-recently-used unexhausted model from the
-    user's CLI session history. Logs the decision clearly so the user can audit
-    the chosen model after the headless run completes.
-    """
-    chosen = candidates[0]
+def _rpm_wait() -> None:
+    """Sleep one rate-limit window (90s + 0–30s jitter) before retry."""
+    secs = RPM_BACKOFF_BASE_SECS + random.uniform(0, RPM_BACKOFF_JITTER_SECS)
     print(
-        f"\n─────────────────────────────────────────────────────────\n"
-        f"[gemini_client] ⚠️  HEADLESS context — /dev/tty unavailable.\n"
-        f"[gemini_client]    Cannot prompt interactively, auto-cascading.\n"
-        f"[gemini_client]    Exhausted: {exhausted_model}\n"
-        f"[gemini_client]    Switching → {chosen}\n"
-        f"[gemini_client]    (most-recent unexhausted model in your CLI history)\n"
-        f"[gemini_client]    Remaining fallbacks if needed: {candidates[1:] or '(none)'}\n"
-        f"[gemini_client]    To force a specific model on next run:\n"
-        f"[gemini_client]      GEMINI_MODEL=<name> /pdf-convert ...\n"
-        f"─────────────────────────────────────────────────────────\n",
-        file=sys.stderr,
+        f"[gemini_client] RPM transient — sleeping {secs:.0f}s before retry",
         flush=True,
     )
-    workspace = _resolve_workspace_dir()
-    if workspace:
-        marker = _write_quota_marker(workspace, exhausted_model, candidates, auto_cascaded_to=chosen)
-        print(f"[gemini_client]    Audit marker: {marker}\n", file=sys.stderr, flush=True)
-    return chosen
+    time.sleep(secs)
 
 
-def _prompt_via_tty(tty, exhausted_model: str, candidates: list[str]) -> Optional[str]:
-    """Interactive menu loop on an opened /dev/tty handle."""
-    banner = (
-        f"\n─────────────────────────────────────────────────────────\n"
-        f"⚠️  QUOTA EXHAUSTED — model: {exhausted_model}\n"
-        f"    (verified by probe call; not a transient error)\n"
-        f"─────────────────────────────────────────────────────────\n"
-        f"Pick a replacement model for the rest of this run\n"
-        f"(in-memory only — your CLI's active model is NOT modified):\n"
+def _verify_rpd_truly_exhausted(model: str) -> bool:
+    """
+    3 probes spaced 120s apart. Any single OK probe → not RPD, return False
+    (caller treats as lingering RPM). All fail → RPD confirmed.
+    """
+    print(
+        f"[gemini_client] verifying RPD for {model} — "
+        f"{RPD_PROBE_COUNT} probes × {RPD_PROBE_INTERVAL_SECS}s",
+        flush=True,
     )
-    menu_lines = [banner]
-    for i, m in enumerate(candidates, 1):
-        menu_lines.append(f"  [{i}] {m}\n")
-    menu_lines.append("  [q] Stop + keep workspace for resume\n")
-    menu_lines.append("Choose: ")
-
-    try:
-        tty.write("".join(menu_lines))
-        tty.flush()
-        for _ in range(3):
-            choice = tty.readline().strip().lower()
-            if choice == "q":
-                tty.write("[gemini_client] user chose to stop. Workspace preserved.\n")
-                tty.flush()
-                return None
-            if choice.isdigit():
-                idx = int(choice)
-                if 1 <= idx <= len(candidates):
-                    chosen = candidates[idx - 1]
-                    tty.write(f"[gemini_client] switching to: {chosen}\n")
-                    tty.flush()
-                    return chosen
-            tty.write("Invalid choice. Enter a number or 'q': ")
-            tty.flush()
-        tty.write("[gemini_client] too many invalid attempts. Stopping.\n")
-        tty.flush()
-        return None
-    finally:
-        tty.close()
-
-
-def _prompt_model_switch(exhausted_model: str) -> Optional[str]:
-    """
-    Pick a replacement model after quota exhaustion.
-
-    - Interactive context (TTY available): prompt user to pick from candidates.
-      Honors prior intent that user manually controls model selection.
-    - Headless context (TTY unavailable, e.g. Gemini CLI extension): auto-cascade
-      to the most-recent unexhausted model. Headless processes must never block
-      on interactive I/O, and stopping mid-pipeline is worse UX than picking the
-      next-most-recent model the user has demonstrably used.
-
-    Returns chosen model id, or None when no alternative exists.
-    Caller must hold _SWITCH_LOCK.
-    """
-    all_known = discover_used_models()
-    candidates = [m for m in all_known if m != exhausted_model and m not in _EXHAUSTED_MODELS]
-
-    if not candidates:
+    for i in range(RPD_PROBE_COUNT):
+        if i > 0:
+            time.sleep(RPD_PROBE_INTERVAL_SECS)
+        if _probe_model_alive(model):
+            print(
+                f"[gemini_client]   probe {i+1}/{RPD_PROBE_COUNT}: OK — "
+                f"not RPD, treating as lingering RPM",
+                flush=True,
+            )
+            return False
         print(
-            f"\n[gemini_client] ⛔ no alternative models found in your Gemini CLI history.\n"
-            f"[gemini_client]    All known models exhausted: {sorted(_EXHAUSTED_MODELS | {exhausted_model})}\n"
-            f"[gemini_client]    Open `gemini` interactively, run /model to switch, then resume.\n",
-            file=sys.stderr,
+            f"[gemini_client]   probe {i+1}/{RPD_PROBE_COUNT}: still exhausted",
+            flush=True,
         )
-        return None
-
-    tty = _try_open_tty()
-    if tty is None:
-        return _auto_cascade_pick(exhausted_model, candidates)
-    return _prompt_via_tty(tty, exhausted_model, candidates)
+    print(f"[gemini_client] RPD confirmed for {model}", flush=True)
+    return True
 
 
-def _handle_quota_exhaustion(failing_model: str, stderr_msg: str) -> None:
+def _cascade_within_pro_ladder(failing_model: str) -> str:
+    """Pick next live Pro from _PRO_LADDER, excluding exhausted. '' if none."""
+    for m in _PRO_LADDER:
+        if m == failing_model:
+            continue
+        if m in _EXHAUSTED_MODELS:
+            continue
+        return m
+    return ""
+
+
+def _handle_quota_exhaustion(failing_model: str, stderr_msg: str) -> str:
     """
-    Coordinated quota-switch flow. First thread in verifies + prompts; others
-    block on the lock and inherit the new cached model on return.
+    Coordinate quota response across worker threads. Returns one of:
+      "retry_same"  — caller backs off (already slept) and retries same model
+      "retry_new"   — _RESOLVED_MODEL_CACHE updated; caller picks up new model
+      (raises QuotaExhaustedError when all Pro candidates are exhausted)
 
-    `failing_model` is the model the caller used when it hit the quota error.
-    If another thread already switched away from it, this returns immediately
-    so the caller retries with the new model. Otherwise we probe-verify, mark
-    the model exhausted, and prompt the user.
-
-    Raises QuotaExhaustedError if user declines, no alternative exists, or
-    /dev/tty is unavailable. On success: updates _RESOLVED_MODEL_CACHE, returns
-    silently → caller retries.
+    Classification:
+      - rpm / ambiguous  → sleep and retry same model
+      - rpd              → verify with 3-probe protocol; if confirmed,
+                           cascade within _PRO_LADDER; else fall back to RPM
+    Single-user / headless: no interactive TTY prompt — quality-first cascade
+    is fully automatic within the Pro tier only, never down to Flash.
     """
     global _RESOLVED_MODEL_CACHE, _TERMINAL_QUOTA
 
+    kind = classify_quota_error(stderr_msg)
+    if kind in ("rpm", "ambiguous", "none"):
+        # "none" only happens if caller passed a non-quota stderr by mistake;
+        # safest bet is still RPM-style backoff rather than escalation.
+        _rpm_wait()
+        return "retry_same"
+
+    # kind == "rpd" — coordinate cascade decision.
     with _SWITCH_LOCK:
         if _TERMINAL_QUOTA:
-            raise QuotaExhaustedError("quota terminal — user declined switch")
+            raise QuotaExhaustedError("terminal quota state")
 
         current = _RESOLVED_MODEL_CACHE
-        # Another thread may have switched after our subprocess started but
-        # before we grabbed the lock. Detect that and let caller retry with new.
         if current and failing_model and current != failing_model:
-            return
+            # Another thread already cascaded; just pick up the new model.
+            return "retry_new"
 
-        target = failing_model or current or ""
-        if target and target in _EXHAUSTED_MODELS:
-            # Another thread already handled this exact failure.
-            return
+        if failing_model and failing_model in _EXHAUSTED_MODELS:
+            # Another thread already marked this exhausted; cascade now.
+            next_pro = _cascade_within_pro_ladder(failing_model)
+            if not next_pro:
+                _TERMINAL_QUOTA = True
+                raise QuotaExhaustedError(
+                    f"All Pro models exhausted: {sorted(_EXHAUSTED_MODELS)}. "
+                    f"Workspace preserved — resume after quota reset."
+                )
+            _RESOLVED_MODEL_CACHE = next_pro
+            return "retry_new"
 
-        # Verify it's a real exhaustion — guards against transient 429 misclassification.
-        if target and not _verify_quota_truly_exhausted(target):
-            print(
-                f"[gemini_client] probe says {target} is responsive — treating as transient.",
-                file=sys.stderr,
-            )
-            return  # caller retries same model
+        if not failing_model:
+            # No model to verify — backoff and retry.
+            _rpm_wait()
+            return "retry_same"
 
-        if target:
-            _EXHAUSTED_MODELS.add(target)
-        chosen = _prompt_model_switch(target or "(cli default)")
-        if not chosen:
+        if not _verify_rpd_truly_exhausted(failing_model):
+            # Lingering RPM after all — back off and retry.
+            _rpm_wait()
+            return "retry_same"
+
+        _EXHAUSTED_MODELS.add(failing_model)
+        next_pro = _cascade_within_pro_ladder(failing_model)
+        workspace = _resolve_workspace_dir()
+        if not next_pro:
             _TERMINAL_QUOTA = True
+            if workspace:
+                _write_quota_marker(
+                    workspace=workspace,
+                    exhausted=failing_model,
+                    candidates=list(_PRO_LADDER),
+                    auto_cascaded_to=None,
+                )
             raise QuotaExhaustedError(
-                f"no replacement model available — all known models exhausted: "
-                f"{sorted(_EXHAUSTED_MODELS)} "
-                f"(or user declined interactive switch)"
+                f"All Pro models exhausted: {sorted(_EXHAUSTED_MODELS)}. "
+                f"Workspace preserved — resume after quota reset."
             )
 
-        _RESOLVED_MODEL_CACHE = chosen
-        return  # caller retries with chosen model
+        print(
+            f"[gemini_client] RPD cascade: {failing_model} → {next_pro} (Pro tier)",
+            flush=True,
+        )
+        if workspace:
+            _write_quota_marker(
+                workspace=workspace,
+                exhausted=failing_model,
+                candidates=list(_PRO_LADDER),
+                auto_cascaded_to=next_pro,
+            )
+        _RESOLVED_MODEL_CACHE = next_pro
+        return "retry_new"
 
 
 def call_gemini(
@@ -471,14 +505,26 @@ def call_gemini(
     timeout: int = CALL_TIMEOUT_SECS,
 ) -> str:
     """
-    Call `gemini -p <prompt> [-m <model>] --yolo --include-directories /tmp` via subprocess.
-    Model defaults to whatever the gemini CLI session has active; pass GEMINI_MODEL
-    env var only if you need to override. Image is embedded as @path in prompt text.
-    """
-    for attempt in range(MAX_RETRIES):
-        # Append variation suffix on retries to avoid repeated empty responses
-        effective_prompt = prompt if attempt == 0 else f"{prompt}\n\n[Retry {attempt}: ensure full ADE extraction]"
+    Call `gemini -p <prompt> [-m <model>] --yolo --include-directories /tmp`.
 
+    Quality-first quota handling:
+      - Empty / short response → MAX_RETRIES attempts with prompt variation.
+      - RPM (or ambiguous) quota error → backoff and retry SAME model, up to
+        RPM_MAX_RETRIES times. Beyond that, escalate to RPD verification.
+      - RPD confirmed → cascade within _PRO_LADDER (Pro tier only). When the
+        ladder is exhausted, raise QuotaExhaustedError so caller can resume.
+
+    Never auto-cascades Pro→Flash. Override model with GEMINI_MODEL env var.
+    """
+    short_attempt = 0
+    rpm_retries = 0
+    while True:
+        # Append variation suffix on short-response retries to break repetition.
+        effective_prompt = (
+            prompt
+            if short_attempt == 0
+            else f"{prompt}\n\n[Retry {short_attempt}: ensure full ADE extraction]"
+        )
         if image_path and Path(image_path).exists():
             effective_prompt += f" @{image_path}"
 
@@ -499,34 +545,51 @@ def call_gemini(
             response = proc.stdout.strip()
             stderr = proc.stderr or ""
 
-            # Quota handling: verify + interactive switch (held by _SWITCH_LOCK).
-            # _handle_quota_exhaustion re-raises QuotaExhaustedError if user declines
-            # or no alternative exists; otherwise it updates the cached model and we
-            # transparently retry on the next loop iteration with the new -m value.
-            #
-            # Short-circuit: if stderr explicitly names a transient vision/stream
-            # error and lacks any quota marker, skip the quota path entirely —
-            # those failures resolve with a plain retry; cascading to a different
-            # model on them just wastes the user's flash quota.
+            # Skip quota path on known transient vision/stream errors that lack
+            # any explicit quota marker — those resolve with a plain retry.
             quota_hit = _is_quota_error(stderr) or _is_quota_error(response)
             if quota_hit and _is_transient_error(stderr) and not _is_quota_error(stderr):
                 quota_hit = False
+
             if quota_hit:
-                _handle_quota_exhaustion(active_model, stderr.strip()[:500] or "quota exhausted")
-                continue  # retry with new model now in _RESOLVED_MODEL_CACHE
+                err_blob = (stderr.strip() or response.strip())[:500] or "quota exhausted"
+                action = _handle_quota_exhaustion(active_model, err_blob)
+                if action == "retry_same":
+                    rpm_retries += 1
+                    if rpm_retries > RPM_MAX_RETRIES:
+                        # Escalate: too many RPM hits in a row likely mean RPD.
+                        # Force the RPD branch by passing an RPD marker phrase.
+                        action = _handle_quota_exhaustion(
+                            active_model, "Daily quota exceeded (RPM retries exhausted)"
+                        )
+                        # Reset counter either way — RPD verify already waited
+                        # ~6 minutes, so the next sample is a fresh window.
+                        rpm_retries = 0
+                    continue
+                if action == "retry_new":
+                    rpm_retries = 0
+                    continue
 
             if len(response) >= MIN_RESPONSE_CHARS:
                 return response
 
             reason = stderr.strip() or f"response too short ({len(response)} chars)"
-            print(f"[gemini_client] attempt {attempt+1}/{MAX_RETRIES} failed: {reason}", flush=True)
+            print(
+                f"[gemini_client] attempt {short_attempt+1}/{MAX_RETRIES} failed: {reason}",
+                flush=True,
+            )
 
         except subprocess.TimeoutExpired:
-            print(f"[gemini_client] attempt {attempt+1}/{MAX_RETRIES} timed out after {timeout}s", flush=True)
+            print(
+                f"[gemini_client] attempt {short_attempt+1}/{MAX_RETRIES} "
+                f"timed out after {timeout}s",
+                flush=True,
+            )
         except FileNotFoundError:
             raise RuntimeError("gemini CLI not found — ensure it is installed and in PATH")
 
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(RETRY_BACKOFF_SECS[attempt])
-
-    raise RuntimeError(f"gemini call failed after {MAX_RETRIES} attempts")
+        if short_attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF_SECS[short_attempt])
+            short_attempt += 1
+            continue
+        raise RuntimeError(f"gemini call failed after {MAX_RETRIES} attempts")
