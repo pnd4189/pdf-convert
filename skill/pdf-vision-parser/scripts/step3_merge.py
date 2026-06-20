@@ -236,11 +236,11 @@ def main():
         print(f"   • {len(chunk_level)} khối dữ liệu Semantic (Chunks)")
         print(f"   • {len(grounding_map)} Mốc tọa độ vật lý và Ô bảng")
 
-        # Dọn dẹp an toàn — chỉ dọn khi dùng default temp dir
-        temp_base = os.path.join(base_dir, ".agents", "temp")
-        if not args.md_dir and os.path.exists(temp_base):
-            shutil.rmtree(temp_base)
-            print("🧹 Đã dọn dẹp thư mục tạm (.agents/temp/).")
+        # Dọn dẹp an toàn — chỉ dọn khi dùng thư mục /tmp/ mặc định của pipeline
+        workspace_dir = os.path.dirname(md_dir)
+        if not args.md_dir and workspace_dir.startswith("/tmp/pdf_convert_"):
+            shutil.rmtree(workspace_dir)
+            print(f"🧹 Đã dọn dẹp thư mục tạm ({workspace_dir}).")
 
     except Exception as e:
         print(f"❌ LỖI NGHIÊM TRỌNG KHI GHI FILE: {e}")

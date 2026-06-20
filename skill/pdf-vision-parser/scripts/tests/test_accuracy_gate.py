@@ -11,8 +11,9 @@ Usage:
     python test_accuracy_gate.py [--corpus-dir <path>] [--gate-threshold 0.95]
 
 The test only validates the Docling parse step (step1), not the full pipeline,
-for fast iteration. Full pipeline accuracy requires running auto_convert.sh
-and diffing Gemini ADE output against ground truth — document that separately.
+for fast iteration. Full pipeline accuracy requires running the agy native
+/pdf-convert flow and diffing the ADE output against ground truth — document
+that separately.
 """
 
 import argparse

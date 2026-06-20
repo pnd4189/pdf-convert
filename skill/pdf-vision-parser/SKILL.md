@@ -3,28 +3,29 @@ name: pdf-vision-parser
 description: Sử dụng kỹ năng này để chuyển đổi tài liệu PDF phức tạp thành Markdown và JSON. Kỹ năng này mô phỏng hoàn hảo kiến trúc Agentic Document Extraction (ADE) của Landing.AI với Cell-level Grounding, Normalized Coordinates và Expanded Ontology.
 ---
 
-> **SLASH COMMAND:** Skill này được gọi qua lệnh `/pdf-convert`.
-> - **Antigravity:** Xem workflow tại `.agent/workflows/pdf-convert.md`.
-> - **Gemini CLI:** Xem command tại `~/.gemini/commands/pdf-convert.toml`.
-> - **Scripts:** `.agent/skills/pdf-vision-parser/scripts/`
+> **SLASH COMMAND:** Skill này được gọi qua lệnh `/pdf-convert` trên **Antigravity CLI (`agy`)**.
+> - **Runtime:** agy đọc workflow tại `.agent/workflows/pdf-convert.md` + skill này tại `.agent/skills/pdf-vision-parser/SKILL.md`.
+> - **Scripts:** `.agent/skills/pdf-vision-parser/scripts/` (gọi tắt `<skill-path>/scripts/`).
+> - **Batch nhiều file:** `bash run-folder.sh <folder>` (mỗi PDF 1 phiên `agy -p`, tuần tự).
 
 # BỐI CẢNH VÀ VAI TRÒ
-Bạn là một AI Agent bóc tách tài liệu cấp độ Enterprise (mô phỏng mô hình nền tảng DPT-2 của Landing.AI) chạy trên Gemini 3.1 Pro-High nội bộ trong Google Antigravity IDE. Nhiệm vụ của bạn là bóc tách file PDF thành định dạng "Visually Grounded Markdown" siêu sạch, và xuất file JSON phân cấp tích hợp Bản đồ Tọa độ (Grounding Map).
+Bạn là một AI Agent bóc tách tài liệu cấp độ Enterprise (mô phỏng mô hình nền tảng DPT-2 của Landing.AI), chạy bằng **chính model active của Antigravity CLI (`agy`)**. Nhiệm vụ của bạn là bóc tách file PDF thành định dạng "Visually Grounded Markdown" siêu sạch, và xuất file JSON phân cấp tích hợp Bản đồ Tọa độ (Grounding Map).
 
 # RÀNG BUỘC KỸ THUẬT TỐI THƯỢNG
 1. **KHÔNG DÙNG API KEY BÊN NGOÀI:** TUYỆT ĐỐI chỉ dùng "đôi mắt" Native Vision của IDE (`view_file`).
 2. **KỶ LUẬT ZERO-HALLUCINATION:** Giả lập trạng thái `Temperature = 0.0`. Trích xuất văn bản, bảng biểu nguyên bản 100%. Không tóm tắt, không suy diễn.
 
 # QUY TRÌNH THỰC THI TỰ ĐỘNG - AGENTIC WORKFLOW
-Thực hiện bằng driver tự động của Gemini CLI. Không dừng sau từng batch để chờ người dùng gõ "Tiếp tục"; nếu bị giới hạn quota/auth/QA thật sự thì dừng fail-fast và giữ workspace để resume.
+Chính model active trong lượt slash-command này là "đôi mắt" bóc tách — tự nhìn ảnh và tự ghi Markdown. Không dùng driver subprocess gọi API. Không dừng sau từng chunk để chờ người dùng gõ "Tiếp tục"; nếu bị lỗi đọc trang thật sự hoặc QA không đạt thì dừng fail-fast và giữ workspace để resume.
 
-## BƯỚC 1: TIỀN XỬ LÝ
-- Slash command `/pdf-convert` chạy `bash /home/dung/.gemini/pdf-convert/auto_convert.sh "<input>" --name "<output_name>" --keep-temp`.
-- Driver gọi `prepare_native_workspace.sh` để render/cache deterministic và tạo `native_manifest.json`. Output PNG dùng 1-indexed, zero-padded: `0001.png`, `0002.png`...
+## BƯỚC 1: TIỀN XỬ LÝ (CHỈ RENDER — KHÔNG GỌI API)
+- Slash command `/pdf-convert` chạy `bash <skill-path>/scripts/prepare_native_workspace.sh "<input>" --name "<output_name>" --keep-temp`.
+- Script chỉ render/cache deterministic và tạo `native_manifest.json` (preprocessing thuần — không gọi model nào, không SDK, không API key). Output PNG dùng 1-indexed, zero-padded: `0001.png`, `0002.png`...
+- Đọc `native_manifest.json` lấy `png_dir`, `md_dir`, `pages`, `visual_candidates`, `skip_native_extraction`.
 
-## BƯỚC 2: BÓC TÁCH THỊ GIÁC CHUẨN LANDING.AI (Vision Loop)
-- Driver dùng Gemini CLI subprocess theo từng trang (`gemini -p`) để nhìn ảnh `page_X.png`. Mỗi subprocess chỉ nhận một trang nên không làm tràn context của chat đang chạy.
-- Ghi Markdown ra `/tmp/pdf_convert_<output_name>/temp_md/page_X.md`. Skip file đã hợp lệ để resume.
+## BƯỚC 2: BÓC TÁCH THỊ GIÁC CHUẨN LANDING.AI (Native Vision Loop)
+- Chính model active của agy dùng công cụ đọc-file/vision native (`view_file`) mở từng ảnh `png_dir/000N.png`. KHÔNG spawn subprocess gọi model ngoài. Xử lý theo chunk ~5-10 trang, xong trang nào buông trang đó nên không tràn context dù tài liệu 100+ trang.
+- Ghi Markdown ra `<md_dir>/page_X.md` (`/tmp/pdf_convert_<output_name>/temp_md/`). Skip file đã hợp lệ để resume.
 - Dòng đầu tiên của mỗi file phải là `<!-- VISION_SOURCE: <đường_dẫn_png> -->` để chứng minh trang được xử lý từ ảnh render.
 - CẤM tạo script kiểu `generate_md.py` để dump text từ Docling JSON sang Markdown. Không fallback text-only cho trang cần vision.
 - Mọi trang trong `native_manifest.json.visual_candidates` bắt buộc phải được mở ảnh PNG và mô tả visual semantics chi tiết.
@@ -111,7 +112,7 @@ extraction on OCR'd PDFs caused `visual_audit` to flag every text page as an
 "uncovered visual region", which led the auto-repair loop to spin until
 exhausted. Standalone images are pure pixels — Docling adds zero structural
 signal. Both formats now go vision-only: normalize/render to PNG (300 DPI for
-PDFs) and let the active Gemini CLI model do full vision extraction directly.
+PDFs) and let the active agy model do full vision extraction directly.
 Docling stays load-bearing for DOCX/PPTX/EPUB where structural extraction is
 trustworthy.
 
@@ -123,53 +124,36 @@ trustworthy.
 - **Non-Latin scanned PDF**: OCR accuracy varies; Latin + CJK + Vietnamese tested
 - **Peak RAM**: <12GB on 16GB system for 250-page PDFs with streaming enabled
 - **Cache**: SHA-256 keyed, LRU 5GB cap, path `.cache/docling/`
-- **`--fast` mode**: PDF-only, skips Docling (Gemini vision-only legacy path)
+- **`--fast` mode**: PDF-only, skips Docling (vision-only render path)
 - **Resume**: deterministic workspace `/tmp/pdf_convert_<name>/` — re-run same command to resume failed pages only
-- **Page-level caching**: step2 skips already-processed pages (check `page_N.md` existence + validity)
-- **Retry**: step2 retries failed pages 2x; QA loop deletes bad pages + re-runs step2 for auto-repair
+- **Page-level caching**: the native loop skips pages whose `page_N.md` already exists and is valid
+- **Retry**: re-open failed pages; QA loop deletes bad `page_N.md` and re-extracts them via native vision
 
-## Auth & Model — Automated Gemini CLI OAuth Driver
+## Auth & Model — Active-Model Native Vision (Antigravity CLI)
 
-`/pdf-convert` dùng driver tự động `/home/dung/.gemini/pdf-convert/auto_convert.sh`.
-Driver được phép gọi `gemini -p` theo từng trang vì đây là cách duy nhất để tài liệu
-lớn chạy tới cuối mà không cần người dùng gõ "Tiếp tục" giữa các lượt chat.
+`/pdf-convert` dùng **chính model active của agy** trong lượt slash-command để nhìn
+ảnh và bóc tách. KHÔNG gọi model qua subprocess, KHÔNG dùng SDK / Vertex / API key.
+Native vision đi qua chính phiên agy đang chạy nên không tốn quota API riêng và
+không dính rate-limit.
 
-Luồng đúng:
+Luồng đúng (đều không gọi model ngoài):
 
-1. Chạy `prepare_native_workspace.sh` để Docling/render/cache deterministic.
-2. Driver gọi `step2_gemini_refine.py` với `PDF_CONVERT_ALLOW_GEMINI_SUBPROCESS=1`.
-3. Mỗi lời gọi Gemini chỉ xử lý một trang PNG và ghi `temp_md/page_N.md`.
-4. Chạy QA bằng `native_manifest.json`; trang lỗi bị xóa và xử lý lại.
-5. Chỉ merge JSON sau khi QA pass. Nếu quota/auth/QA vẫn fail sau retry, giữ workspace để resume.
+1. `<skill-path>/scripts/prepare_native_workspace.sh` — render PNG + Docling cache + `native_manifest.json` (preprocessing thuần).
+2. Model active tự `view_file` từng PNG, tự ghi `temp_md/page_N.md`, theo chunk ~5-10 trang, resume bằng cách skip file đã hợp lệ.
+3. `step2.75_qa_sweep.py` — QA thuần Python; trang lỗi sửa lại bằng cách mở lại ảnh.
+4. `step3_merge.py` — merge JSON thuần Python. Chỉ merge sau khi QA đạt 0 CRITICAL.
+5. Nếu một trang thật sự không đọc được hoặc QA không đạt sau retry → fail-fast, giữ workspace để resume.
 
-Không dùng Google GenAI SDK, Vertex hoặc API key. `gemini_client.py` strip các biến
-môi trường API-key/Vertex để ép subprocess dùng OAuth của Gemini CLI.
+**Tại sao không cần "đọc 247 trang cùng lúc":** mỗi trang xử lý xong là ghi file rồi
+buông khỏi context, nên tài liệu lớn vẫn chạy hết mà không tràn context.
 
-**Quota-aware model switch (interactive)**:
+**Chọn model:** mặc định pin `Gemini 3.1 Pro (High)` của agy (vision/ADE mạnh nhất);
+batch chỉnh qua biến `PDF_MODEL` của `run-folder.sh`.
 
-- Default vẫn dùng đúng model active trong CLI session (không tự ý đổi).
-- Khi gặp `RESOURCE_EXHAUSTED/429`, driver gọi `_verify_quota_truly_exhausted()` (probe call) để loại false-positive.
-- Nếu xác nhận exhausted thật, prompt qua `/dev/tty` liệt kê các model user **đã từng dùng** (lấy từ `~/.gemini/tmp/*/chats/*.jsonl` — không hardcode):
-  ```
-  ⚠️  QUOTA EXHAUSTED — model: gemini-3.1-pro-preview
-  Pick a replacement model for the rest of this run:
-    [1] gemini-2.5-pro
-    [2] gemini-2.5-flash
-    [q] Stop + keep workspace for resume
-  Choose:
-  ```
-- Lựa chọn của user chỉ áp dụng **trong process hiện tại** (in-memory `_RESOLVED_MODEL_CACHE`); không ghi vào `~/.gemini/settings.json`, không phá CLI session.
-- **Headless mode** (Gemini CLI extension slash-command, CI, redirected stdio — `/dev/tty` không khả dụng): tự động cascade sang model tiếp theo trong `discover_used_models()` (recency order), log decision rõ ràng:
-  ```
-  [gemini_client] ⚠️  HEADLESS context — /dev/tty unavailable.
-  [gemini_client]    Switching → gemini-3-flash-preview (most-recent unexhausted)
-  [gemini_client]    Remaining fallbacks: [gemini-2.5-pro]
-  [gemini_client]    To force a specific model on next run:
-  [gemini_client]      GEMINI_MODEL=<name> /pdf-convert ...
-  ```
-  Đồng thời ghi `QUOTA_PROMPT.json` vào workspace với field `auto_cascaded_to` để audit.
-- Nếu user chọn `q` (interactive) hoặc tất cả model đã exhausted (headless) → terminal quota → giữ workspace để resume sau.
-- Mọi lần switch (interactive hay auto-cascade) đều exclude các model đã exhausted khỏi list lần sau.
+**Lưu ý:** đường subprocess cũ (`auto_convert.sh` / `step2_gemini_refine.py` /
+`gemini_client.py` gọi `gemini -p`) **đã bị xóa khỏi repo** vì Google khai tử
+Gemini CLI (binary `gemini` báo `IneligibleTierError`). Runtime duy nhất là agy
+native ở trên — đừng tái tạo đường subprocess gọi model ngoài.
 
 **Fail-fast visual guardrail**:
 
@@ -177,4 +161,4 @@ môi trường API-key/Vertex để ép subprocess dùng OAuth của Gemini CLI.
 - Cho PDF: manifest set `skip_visual_audit=true` → bỏ check visual_candidate (không có Docling baseline đáng tin).
 - `step2.75_qa_sweep.py` exit code 0 (PASS) | 1 (HARD: anchor/box/table/vision-provenance — repair được) | 2 (SOFT-only: figure/keyword — caller có thể accept).
 - QA chỉ flag keyword khi có chỉ thị tham chiếu thị giác rõ ràng ("xem hình", "biểu đồ 2.3", "圖 3", "hình bên trái"...) — không match standalone "đồ"/"hình" trong văn xuôi chuyên môn.
-- `auto_convert.sh` auto-repair loop detect stuck pages (cùng failure 2 lần liên tiếp → dừng), accept SOFT-only failures và tiếp tục merge.
+- Nếu QA báo HARD fail, model active mở lại đúng trang đó và sửa `.md`; SOFT-only (figure/keyword) có thể accept rồi merge. Tránh lặp vô hạn: cùng một trang fail 2 lần liên tiếp thì dừng và giữ workspace để resume.

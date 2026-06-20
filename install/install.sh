@@ -1,29 +1,22 @@
 #!/usr/bin/env bash
-# install.sh — wire repo files into the Gemini CLI runtime via symlinks.
+# install.sh — wire this repo into the Antigravity CLI (agy) runtime via symlinks
+# so the repo stays the single source of truth (edit repo → runtime sees it).
 #
-# Layout after install:
-#   ~/.gemini/commands/pdf-convert.toml  → repo/install/commands/pdf-convert.toml
-#   ~/.gemini/pdf-convert/               → repo/install/pdf-convert/
+# agy reads .agent/skills + .agent/workflows directly. We symlink the skill's
+# SKILL.md and Python pipeline into the Antigravity skills dir:
+#   <ANTIGRAVITY>/skills/pdf-vision-parser/scripts   → repo/skill/pdf-vision-parser/scripts/
+#   <ANTIGRAVITY>/skills/pdf-vision-parser/SKILL.md   → repo/skill/pdf-vision-parser/SKILL.md
 #
-# Optional (--with-scripts): also wire the Python pipeline so SOURCE_SCRIPT_DIR
-# resolves to the repo's skill dir instead of an out-of-tree copy:
-#   <ANTIGRAVITY scripts dir>            → repo/skill/pdf-vision-parser/scripts/
-#
-# Symlinks (not copies) keep the repo as the single source of truth, so any
-# edit in the repo is reflected in the live runtime without re-running install.
+# (Google retired the Gemini CLI; its ~/.gemini wiring has been removed.)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALL_DIR="$REPO_ROOT/install"
-GEMINI_HOME="${GEMINI_HOME:-$HOME/.gemini}"
 ANTIGRAVITY_SCRIPTS="${ANTIGRAVITY_SCRIPTS:-$HOME/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts}"
 
-WITH_SCRIPTS=0
 for arg in "$@"; do
     case "$arg" in
-        --with-scripts) WITH_SCRIPTS=1 ;;
         -h|--help)
-            sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
@@ -49,15 +42,12 @@ link_replace() {
     echo "  link $link → $target"
 }
 
-echo "[install] repo:        $REPO_ROOT"
-echo "[install] gemini home: $GEMINI_HOME"
+echo "[install] repo:                $REPO_ROOT"
+echo "[install] antigravity scripts: $ANTIGRAVITY_SCRIPTS"
 
-link_replace "$INSTALL_DIR/commands/pdf-convert.toml" "$GEMINI_HOME/commands/pdf-convert.toml"
-link_replace "$INSTALL_DIR/pdf-convert"               "$GEMINI_HOME/pdf-convert"
+link_replace "$REPO_ROOT/skill/pdf-vision-parser/scripts" "$ANTIGRAVITY_SCRIPTS"
+# Keep SKILL.md single-sourced too — a divergent copy is what let the dead
+# subprocess path resurface before.
+link_replace "$REPO_ROOT/skill/pdf-vision-parser/SKILL.md" "$(dirname "$ANTIGRAVITY_SCRIPTS")/SKILL.md"
 
-if [[ "$WITH_SCRIPTS" -eq 1 ]]; then
-    echo "[install] antigravity scripts target: $ANTIGRAVITY_SCRIPTS"
-    link_replace "$REPO_ROOT/skill/pdf-vision-parser/scripts" "$ANTIGRAVITY_SCRIPTS"
-fi
-
-echo "[install] done — verify with: gemini /pdf-convert"
+echo "[install] done — verify with: agy then /pdf-convert <file>"

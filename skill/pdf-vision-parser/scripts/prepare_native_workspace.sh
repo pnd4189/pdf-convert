@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# prepare_native_workspace.sh — preprocessing only for Gemini CLI native-model PDF conversion.
+# prepare_native_workspace.sh — preprocessing only for agy (Antigravity CLI) native-model PDF conversion.
 #
-# This script intentionally stops before vision extraction. The active Gemini
-# CLI slash-command model must inspect rendered page images itself and write
-# page_N.md files. Do not call `gemini -p`, Google GenAI SDKs, Vertex, or any
-# API-key path from here.
+# This script intentionally stops before vision extraction. The active agy
+# slash-command model must inspect rendered page images itself and write
+# page_N.md files. Do not call any model subprocess, Google GenAI SDKs, Vertex,
+# or any API-key path from here.
 set -euo pipefail
 
 SOURCE_SCRIPT_DIR="${PDF_CONVERT_SOURCE_SCRIPT_DIR:-/home/dung/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts}"

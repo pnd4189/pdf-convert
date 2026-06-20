@@ -1,47 +1,37 @@
 # /pdf-convert install
 
-Wires this repo into the Gemini CLI runtime as a single source of truth.
-After install, the `/pdf-convert` slash command resolves directly to files
-in this repo via symlinks — edit the repo, the runtime sees it immediately.
+**Runtime = Antigravity CLI (`agy`).** Google retired the Gemini CLI (`gemini`
+binary errors `IneligibleTierError`), so agy is the only live runtime. agy reads
+`.agent/skills` + `.agent/workflows` directly. This installer symlinks the skill
+into the Antigravity skills dir so the repo stays the single source of truth —
+edit the repo, the runtime sees it immediately.
 
 ## Install
 
 ```bash
-./install/install.sh                # commands + driver only
-./install/install.sh --with-scripts # also symlink the Python pipeline
-                                    # to <ANTIGRAVITY scripts dir>
+./install/install.sh    # symlink SKILL.md + Python pipeline into the agy skills dir
 ```
 
-Pre-existing files at the target paths are renamed `*.bak-<timestamp>` before
-the symlink is created — nothing is overwritten silently.
+Override the target with `ANTIGRAVITY_SCRIPTS=...` (defaults to
+`$HOME/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts`). Pre-existing files
+at the target paths are renamed `*.bak-<timestamp>` before linking — nothing is
+overwritten silently.
 
 ## What gets linked
 
-| Target (runtime)                                         | Source (this repo)                                |
-| -------------------------------------------------------- | ------------------------------------------------- |
-| `~/.gemini/commands/pdf-convert.toml`                    | `install/commands/pdf-convert.toml`               |
-| `~/.gemini/pdf-convert/`                                 | `install/pdf-convert/`                            |
-| `$ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts` * | `skill/pdf-vision-parser/scripts/`                |
+| Target (runtime)                                        | Source (this repo)                 |
+| ------------------------------------------------------- | ---------------------------------- |
+| `$ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts`  | `skill/pdf-vision-parser/scripts/` |
+| `$ANTIGRAVITY/.agent/skills/pdf-vision-parser/SKILL.md` | `skill/pdf-vision-parser/SKILL.md` |
 
-\* only with `--with-scripts`. Defaults to `$HOME/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts`; override with `ANTIGRAVITY_SCRIPTS=...`.
+## Batch conversion
 
-## Why this layout
-
-Earlier versions shipped a workspace `.gemini/` inside the repo. When the
-user also had `~/.gemini/commands/pdf-convert.toml`, Gemini CLI saw two
-definitions of the same command and auto-renamed both to
-`/workspace.pdf-convert` / `/user.pdf-convert`, breaking the bare
-`/pdf-convert` invocation.
-
-Moving the shipped files under `install/` (not `.gemini/`) means the repo is
-no longer recognized as a workspace skill source by Gemini, eliminating the
-collision. The installer then wires user-scope only.
+`bash run-folder.sh <folder>` (repo root) converts every PDF in a folder
+sequentially — one `agy -p "/pdf-convert ..."` session per file, native vision.
 
 ## Uninstall
 
 ```bash
-rm ~/.gemini/commands/pdf-convert.toml
-rm ~/.gemini/pdf-convert
-# (optional) restore the latest backup:
-# mv ~/.gemini/commands/pdf-convert.toml.bak-<ts> ~/.gemini/commands/pdf-convert.toml
+rm "$HOME/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts"   # symlink
+rm "$HOME/ANTIGRAVITY/.agent/skills/pdf-vision-parser/SKILL.md"  # symlink
 ```

@@ -3,7 +3,7 @@
 visual_audit.py — Detect rendered pages that contain visual content not covered
 by Docling text/table boxes.
 
-This is a deterministic guardrail for the native Gemini CLI PDF workflow. It
+This is a deterministic guardrail for the native agy (Antigravity CLI) PDF workflow. It
 does not describe images; it only flags pages where the active model must look
 at the PNG and produce figure/table semantics instead of accepting a Docling
 text dump.

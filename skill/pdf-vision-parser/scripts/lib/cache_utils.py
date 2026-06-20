@@ -68,7 +68,7 @@ def lru_evict() -> None:
     d = cache_dir()
     entries = sorted(
         [p for p in d.glob("*.json")],
-        key=lambda p: p.stat().st_atime
+        key=lambda p: p.stat().st_mtime
     )
     total = sum(p.stat().st_size for p in entries)
     for p in entries:

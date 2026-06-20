@@ -250,12 +250,12 @@ def run_qa(md_dir, manifest_path=None):
                 )
 
         # Check 4: native vision provenance. This catches text-only helper dumps
-        # such as generate_md.py; the active Gemini CLI model must explicitly mark
+        # such as generate_md.py; the active agy model must explicitly mark
         # that it inspected the rendered page image.
         if pages_requiring_vision and pnum in pages_requiring_vision and not VISION_SOURCE_RE.search(content):
             issues.append(
                 "[CRITICAL] Thiếu marker `<!-- VISION_SOURCE: ... -->`. "
-                "Trang này phải được trích xuất từ ảnh PNG bằng model Gemini CLI đang chạy, "
+                "Trang này phải được trích xuất từ ảnh PNG bằng model agy đang chạy, "
                 "không được dump text từ Docling/generate_md.py."
             )
 
