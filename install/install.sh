@@ -3,15 +3,17 @@
 # so the repo stays the single source of truth (edit repo → runtime sees it).
 #
 # agy reads .agent/skills + .agent/workflows directly. We symlink the skill's
-# SKILL.md and Python pipeline into the Antigravity skills dir:
+# SKILL.md, Python pipeline, and the /pdf-convert workflow into the runtime:
 #   <ANTIGRAVITY>/skills/pdf-vision-parser/scripts   → repo/skill/pdf-vision-parser/scripts/
 #   <ANTIGRAVITY>/skills/pdf-vision-parser/SKILL.md   → repo/skill/pdf-vision-parser/SKILL.md
+#   <ANTIGRAVITY>/workflows/pdf-convert.md            → repo/skill/pdf-vision-parser/pdf-convert.workflow.md
 #
 # (Google retired the Gemini CLI; its ~/.gemini wiring has been removed.)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANTIGRAVITY_SCRIPTS="${ANTIGRAVITY_SCRIPTS:-$HOME/ANTIGRAVITY/.agent/skills/pdf-vision-parser/scripts}"
+ANTIGRAVITY_WORKFLOW="${ANTIGRAVITY_WORKFLOW:-$HOME/ANTIGRAVITY/.agent/workflows/pdf-convert.md}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -49,5 +51,9 @@ link_replace "$REPO_ROOT/skill/pdf-vision-parser/scripts" "$ANTIGRAVITY_SCRIPTS"
 # Keep SKILL.md single-sourced too — a divergent copy is what let the dead
 # subprocess path resurface before.
 link_replace "$REPO_ROOT/skill/pdf-vision-parser/SKILL.md" "$(dirname "$ANTIGRAVITY_SCRIPTS")/SKILL.md"
+# The /pdf-convert workflow body agy executes — keep it single-sourced too. A
+# stale divergent copy here once told the model to pause for "Tiếp tục" and used
+# the wrong PNG indexing, derailing unattended runs.
+link_replace "$REPO_ROOT/skill/pdf-vision-parser/pdf-convert.workflow.md" "$ANTIGRAVITY_WORKFLOW"
 
 echo "[install] done — verify with: agy then /pdf-convert <file>"

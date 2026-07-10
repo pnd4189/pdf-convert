@@ -183,7 +183,7 @@ def run_qa(md_dir, manifest_path=None):
     print("\n" + "=" * 50 + "\n  🚀 LANDING.AI - ADE QA SWEEP\n" + "=" * 50)
 
     expected_pages = {int(p) for p in manifest.get("pages", []) if str(p).isdigit()} if manifest else set()
-    present_pages = {page_num(f) for f in files}
+    present_pages = {page_num(f) + 1 for f in files}
     missing_pages = sorted(expected_pages - present_pages)
     if missing_pages:
         print("📄 MISSING PAGE FILES:")
@@ -196,6 +196,7 @@ def run_qa(md_dir, manifest_path=None):
         with open(os.path.join(md_dir, fname), "r", encoding="utf-8") as f:
             content = f.read()
         pnum = page_num(fname)
+        pnum_1based = pnum + 1
         if BLANK_PAGE_RE.search(content):
             continue
 
@@ -252,7 +253,7 @@ def run_qa(md_dir, manifest_path=None):
         # Check 4: native vision provenance. This catches text-only helper dumps
         # such as generate_md.py; the active agy model must explicitly mark
         # that it inspected the rendered page image.
-        if pages_requiring_vision and pnum in pages_requiring_vision and not VISION_SOURCE_RE.search(content):
+        if pages_requiring_vision and pnum_1based in pages_requiring_vision and not VISION_SOURCE_RE.search(content):
             issues.append(
                 "[CRITICAL] Thiếu marker `<!-- VISION_SOURCE: ... -->`. "
                 "Trang này phải được trích xuất từ ảnh PNG bằng model agy đang chạy, "
@@ -262,7 +263,7 @@ def run_qa(md_dir, manifest_path=None):
         # Check 5: visual semantics for diagrams/figures. If deterministic image
         # audit found dark visual regions not covered by Docling text/table boxes,
         # Markdown must contain a real figure description or a structured table.
-        page_candidates = visual_candidates.get(pnum, [])
+        page_candidates = visual_candidates.get(pnum_1based, [])
         has_html_table = bool(TABLE_HTML_RE.search(content))
         figures = [m.group(1).strip() for m in FIGURE_RE.finditer(content)]
         all_ontology = [m.group(1).strip() for m in ONTOLOGY_RE.finditer(content)]

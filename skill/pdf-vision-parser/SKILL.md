@@ -20,12 +20,16 @@ Chính model active trong lượt slash-command này là "đôi mắt" bóc tác
 
 ## BƯỚC 1: TIỀN XỬ LÝ (CHỈ RENDER — KHÔNG GỌI API)
 - Slash command `/pdf-convert` chạy `bash <skill-path>/scripts/prepare_native_workspace.sh "<input>" --name "<output_name>" --keep-temp`.
+- **Nếu workspace `/tmp/pdf_convert_<output_name>/` đã có `native_manifest.json`** (batch wrapper `run-folder.sh` đã prepare sẵn) thì **BỎ QUA bước này** — chỉ đọc manifest và sang BƯỚC 2. Không chạy lại prepare, không đổi `<output_name>`.
 - Script chỉ render/cache deterministic và tạo `native_manifest.json` (preprocessing thuần — không gọi model nào, không SDK, không API key). Output PNG dùng 1-indexed, zero-padded: `0001.png`, `0002.png`...
 - Đọc `native_manifest.json` lấy `png_dir`, `md_dir`, `pages`, `visual_candidates`, `skip_native_extraction`.
 
 ## BƯỚC 2: BÓC TÁCH THỊ GIÁC CHUẨN LANDING.AI (Native Vision Loop)
+- **BẮT BUỘC trước khi bóc trang đầu tiên:** đọc file `<skill-path>/scripts/ade_prompt_vision.txt` — đây là HỢP ĐỒNG ĐẦU RA canonical (MANDATORY OUTPUT CONTRACT + worked example byte-chuẩn). Thay `__PNG_DIR__`/`__MD_DIR__`/`__NPAGES__` bằng giá trị từ manifest và áp dụng NGUYÊN VĂN cho mọi trang. Mục "KỶ LUẬT TRÍCH XUẤT ADE" bên dưới là cùng một spec ở dạng diễn giải; khi nghi ngờ, format trong template thắng.
 - Chính model active của agy dùng công cụ đọc-file/vision native (`view_file`) mở từng ảnh `png_dir/000N.png`. KHÔNG spawn subprocess gọi model ngoài. Xử lý theo chunk ~5-10 trang, xong trang nào buông trang đó nên không tràn context dù tài liệu 100+ trang.
+- **KHÔNG dừng chờ người dùng gõ "Tiếp tục".** Lượt slash-command này chạy print mode không có người ngồi gõ tiếp — tự đi hết MỌI trang trong một phiên.
 - Ghi Markdown ra `<md_dir>/page_X.md` (`/tmp/pdf_convert_<output_name>/temp_md/`). Skip file đã hợp lệ để resume.
+- **Quy ước số trang (chống lệch):** `page_X.md` chứa trang ID `X` (zero-based), ứng với ảnh số `X+1`. Tức `page_0.md ↔ 0001.png`, `page_9.md ↔ 0010.png`. Tuyệt đối giữ đúng ánh xạ này, không ghi nội dung ảnh `000N.png` dưới nhãn `page_N.md`.
 - Dòng đầu tiên của mỗi file phải là `<!-- VISION_SOURCE: <đường_dẫn_png> -->` để chứng minh trang được xử lý từ ảnh render.
 - CẤM tạo script kiểu `generate_md.py` để dump text từ Docling JSON sang Markdown. Không fallback text-only cho trang cần vision.
 - Mọi trang trong `native_manifest.json.visual_candidates` bắt buộc phải được mở ảnh PNG và mô tả visual semantics chi tiết.
@@ -40,8 +44,10 @@ Chính model active trong lượt slash-command này là "đôi mắt" bóc tác
 - Chạy lại script đến khi báo 0 CRITICAL mới được sang Bước 3.
 
 ## BƯỚC 3: TỔNG HỢP VÀ ĐÓNG GÓI JSON
-- Chạy `step3_merge.py`. File kết quả lưu tại `/home/dung/ANTIGRAVITY/SÁCH CONVERT/`.
+- Chạy `step3_merge.py --name "<output_name>"`. File kết quả lưu tại `/home/dung/ANTIGRAVITY/SÁCH CONVERT/<output_name>.json`.
 - Xác minh file JSON được tạo thành công mới được dọn dẹp thư mục tạm.
+
+> **Chế độ batch (wrapper `run-folder.sh`):** wrapper đã làm BƯỚC 1, tự inject thẳng nội dung `ade_prompt_vision.txt` vào phiên `agy -p` (không đi qua slash command này), và sẽ tự chạy BƯỚC 2.75 + BƯỚC 3. Phiên vision CHỈ làm BƯỚC 2 (ghi đủ `page_X.md`) rồi DỪNG — không chạy QA/merge, không dọn workspace.
 
 # KỶ LUẬT TRÍCH XUẤT ADE (ÁP DỤNG TRONG BƯỚC 2)
 
@@ -150,10 +156,11 @@ buông khỏi context, nên tài liệu lớn vẫn chạy hết mà không trà
 **Chọn model:** mặc định pin `Gemini 3.1 Pro (High)` của agy (vision/ADE mạnh nhất);
 batch chỉnh qua biến `PDF_MODEL` của `run-folder.sh`.
 
-**Lưu ý:** đường subprocess cũ (`auto_convert.sh` / `step2_gemini_refine.py` /
-`gemini_client.py` gọi `gemini -p`) **đã bị xóa khỏi repo** vì Google khai tử
-Gemini CLI (binary `gemini` báo `IneligibleTierError`). Runtime duy nhất là agy
-native ở trên — đừng tái tạo đường subprocess gọi model ngoài.
+**Lưu ý:** Google đã khai tử Gemini CLI (binary `gemini` báo `IneligibleTierError`),
+nên runtime DUY NHẤT là agy native vision ở trên. KHÔNG spawn bất kỳ subprocess nào
+gọi model/API ngoài (Gemini CLI, SDK GenAI, Vertex, API key) và KHÔNG đi tìm/tái tạo
+các script driver subprocess đã bị xóa. Nếu cần "bước kết thúc", đó là `step3_merge.py`
+(hoặc wrapper batch tự lo) — không có script orchestrator nào khác để tìm.
 
 **Fail-fast visual guardrail**:
 
